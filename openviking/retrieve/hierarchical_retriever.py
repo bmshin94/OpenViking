@@ -21,6 +21,7 @@ from openviking.models.embedder.base import EmbedResult, embed_compat
 from openviking.models.rerank import RerankClient
 from openviking.retrieve.memory_lifecycle import hotness_score
 from openviking.retrieve.retrieval_stats import get_stats_collector
+from openviking.retrieve.skill_results import SkillResultResolver, candidate_key, skill_root_uri
 from openviking.server.identity import RequestContext
 from openviking.storage.abstract_overview import body_for_preview
 from openviking.storage.expr import FilterExpr
@@ -108,6 +109,7 @@ class HierarchicalRetriever:
         score_gte: bool = False,
         scope_dsl: Optional[FilterExpr | Dict[str, Any]] = None,
         level: Optional[List[int]] = None,
+        skill_resolver: Optional[SkillResultResolver] = None,
     ) -> QueryResult:
         """
         Execute hierarchical retrieval.
@@ -190,23 +192,63 @@ class HierarchicalRetriever:
             telemetry.count("vector.scored", len(quick_results))
             telemetry.count("vector.scanned", len(quick_results))
 
-            collected_by_uri: Dict[str, Dict[str, Any]] = {}
-            for result in quick_results:
-                uri = result.get("uri", "")
-                if not uri:
-                    continue
-
-                score = self._finite_score(result.get("_score", 0.0))
-                if not self._passes_threshold(score, effective_threshold, score_gte):
-                    continue
-
-                candidate = dict(result)
-                candidate["_score"] = score
-                candidate["_final_score"] = score
-
-                previous = collected_by_uri.get(uri)
-                if previous is None or score > previous.get("_final_score", 0.0):
-                    collected_by_uri[uri] = candidate
+            collected_by_uri: Dict[Any, Dict[str, Any]] = {}
+            offset = 0
+            has_skill = False
+            seen_keys = set()
+            while True:
+                page_keys = {candidate_key(result) for result in quick_results}
+                if offset and page_keys and page_keys <= seen_keys:
+                    raise RuntimeError(
+                        "Skill search pagination did not advance; results are incomplete"
+                    )
+                seen_keys.update(page_keys)
+                for result in quick_results:
+                    uri = result.get("uri", "")
+                    if not uri:
+                        continue
+                    has_skill |= result.get("context_type") == ContextType.SKILL.value
+                    score = self._finite_score(result.get("_score", 0.0))
+                    if not self._passes_threshold(score, effective_threshold, score_gte):
+                        continue
+                    candidate = dict(result)
+                    candidate["_score"] = score
+                    candidate["_final_score"] = score
+                    key = candidate_key(candidate) if skill_resolver else uri
+                    previous = collected_by_uri.get(key)
+                    if previous is None or score > previous.get("_final_score", 0.0):
+                        collected_by_uri[key] = candidate
+                if not skill_resolver or not has_skill or len(quick_results) < search_limit:
+                    break
+                # QUICK pages are ordered by vector score. Once their boundary
+                # fails the threshold, later pages cannot add eligible hits.
+                # An invalid score does not establish a safe stopping boundary.
+                boundary_score = self._finite_score(
+                    quick_results[-1].get("_score"), default=math.nan
+                )
+                if math.isfinite(boundary_score) and not self._passes_threshold(
+                    boundary_score, effective_threshold, score_gte
+                ):
+                    break
+                visible_matches = await self._convert_to_matched_contexts(
+                    list(collected_by_uri.values()), ctx=ctx, apply_hotness=False
+                )
+                if len(await skill_resolver.resolve(visible_matches)) >= limit:
+                    break
+                offset += len(quick_results)
+                quick_results = await vector_proxy.search_in_tenant(
+                    query_vector=query_vector,
+                    sparse_query_vector=sparse_query_vector,
+                    context_type=context_type,
+                    target_directories=target_dirs,
+                    extra_filter=scope_dsl,
+                    level=level,
+                    limit=search_limit,
+                    offset=offset,
+                )
+                telemetry.count("vector.searches", 1)
+                telemetry.count("vector.scored", len(quick_results))
+                telemetry.count("vector.scanned", len(quick_results))
 
             candidates = sorted(
                 collected_by_uri.values(),
@@ -245,6 +287,7 @@ class HierarchicalRetriever:
                 telemetry.count("vector.searches", 1)
                 telemetry.count("vector.scored", len(leaf_results))
                 telemetry.count("vector.scanned", len(leaf_results))
+
                 if self._rerank_client and mode == RetrieverMode.THINKING and leaf_results:
                     leaf_scores = await self._rerank_scores(
                         query.query,
@@ -298,13 +341,17 @@ class HierarchicalRetriever:
 
             # Add directory hits to the result pool only when explicitly requested.
             initial_candidates = list(leaf_results)
-            if level is not None:
-                for result, score in zip(global_results, directory_scores, strict=True):
-                    if result.get("level", 2) not in level:
+            for result, score in zip(global_results, directory_scores, strict=True):
+                if level is None:
+                    # Skill roots must remain searchable before old packages
+                    # have been rebuilt with child records.
+                    if not skill_resolver or result.get("context_type") != "skill":
                         continue
-                    candidate = dict(result)
-                    candidate["_score"] = score
-                    initial_candidates.append(candidate)
+                elif result.get("level", 2) not in level:
+                    continue
+                candidate = dict(result)
+                candidate["_score"] = score
+                initial_candidates.append(candidate)
 
             # Step 4: Recursive search
             with telemetry.measure("search.vector_retrieval"):
@@ -323,7 +370,91 @@ class HierarchicalRetriever:
                     scope_dsl=scope_dsl,
                     initial_candidates=initial_candidates,
                     level=level,
+                    skill_resolver=skill_resolver,
                 )
+
+            # Directory counts alone cannot establish that enough Skills match:
+            # their files may fail the requested level, threshold or root ACL.
+            # Resume global pages only after evaluating the completed results.
+            if skill_resolver and any(
+                item.get("context_type") == "skill"
+                for item in [*global_results, *leaf_results, *candidates]
+            ):
+                page_size = max(limit, self.GLOBAL_SEARCH_TOPK)
+                pending = [
+                    (levels, len(page), {candidate_key(item) for item in page})
+                    for levels, page in [([0, 1], global_results), ([2], leaf_results)]
+                    if len(page) >= page_size
+                ]
+                while pending:
+                    converted = await self._convert_to_matched_contexts(candidates, ctx=ctx)
+                    if len(await skill_resolver.resolve(converted)) >= limit:
+                        break
+                    page_levels, offset, seen = pending.pop(0)
+                    page = await vector_proxy.search_in_tenant(
+                        query_vector=query_vector,
+                        sparse_query_vector=sparse_query_vector,
+                        context_type=context_type,
+                        target_directories=target_dirs,
+                        extra_filter=scope_dsl,
+                        level=page_levels,
+                        limit=page_size,
+                        offset=offset,
+                    )
+                    telemetry.count("vector.searches", 1)
+                    telemetry.count("vector.scored", len(page))
+                    telemetry.count("vector.scanned", len(page))
+                    keys = {candidate_key(item) for item in page}
+                    if keys and keys <= seen:
+                        raise RuntimeError(
+                            "Skill search pagination did not advance; results are incomplete"
+                        )
+                    if len(page) >= page_size:
+                        pending.append((page_levels, offset + len(page), seen | keys))
+                    # Extra searches are only for Skill completeness. Do not
+                    # expand resource/memory candidates beyond their old path.
+                    skill_page = [
+                        item
+                        for item in page
+                        if item.get("context_type") == "skill" and item.get("uri")
+                    ]
+                    if not skill_page:
+                        continue
+                    scores = [self._finite_score(item.get("_score", 0.0)) for item in skill_page]
+                    if self._rerank_client and mode == RetrieverMode.THINKING:
+                        scores = await self._rerank_scores(
+                            query.query,
+                            [str(item.get("abstract", "")) for item in skill_page],
+                            scores,
+                        )
+                    more_starts = []
+                    more_candidates = [
+                        {**item, "_score": item.get("_final_score", item.get("_score", 0.0))}
+                        for item in candidates
+                    ]
+                    for item, score in zip(skill_page, scores, strict=True):
+                        if page_levels != [2] and item.get("uri") not in seen_starting_uris:
+                            more_starts.append((item["uri"], score))
+                            seen_starting_uris.add(item["uri"])
+                        if level is None or item.get("level", 2) in level:
+                            more_candidates.append({**item, "_score": score})
+                    candidates = await self._recursive_search(
+                        vector_proxy=vector_proxy,
+                        query=query.query,
+                        query_vector=query_vector,
+                        sparse_query_vector=sparse_query_vector,
+                        starting_points=more_starts,
+                        limit=limit,
+                        mode=mode,
+                        threshold=effective_threshold,
+                        score_gte=score_gte,
+                        context_type=context_type,
+                        target_dirs=target_dirs,
+                        scope_dsl=scope_dsl,
+                        initial_candidates=more_candidates,
+                        level=level,
+                        skill_resolver=skill_resolver,
+                    )
             apply_hotness = True
             rerank_used = self._rerank_client is not None and mode == RetrieverMode.THINKING
 
@@ -333,6 +464,8 @@ class HierarchicalRetriever:
             ctx=ctx,
             apply_hotness=apply_hotness,
         )
+        if skill_resolver:
+            matched = await skill_resolver.resolve(matched)
         final = matched[:limit]
 
         elapsed_ms = (time.monotonic() - t0) * 1000
@@ -434,6 +567,7 @@ class HierarchicalRetriever:
         scope_dsl: Optional[FilterExpr | Dict[str, Any]] = None,
         initial_candidates: Optional[List[Dict[str, Any]]] = None,
         level: Optional[List[int]] = None,
+        skill_resolver: Optional[SkillResultResolver] = None,
     ) -> List[Dict[str, Any]]:
         """
         Recursive search with directory priority return and score propagation.
@@ -448,13 +582,18 @@ class HierarchicalRetriever:
 
         sparse_query_vector = sparse_query_vector or None
 
-        collected_by_uri: Dict[str, Dict[str, Any]] = {}
+        collected_by_uri: Dict[Any, Dict[str, Any]] = {}
         dir_queue: List[tuple] = []  # Priority queue: (-score, uri)
         visited: set = set()
         prev_topk_uris: set = set()
         prev_pool_size = 0
         convergence_rounds = 0
         stagnant_rounds = 0
+        has_skill = False
+        pending_pages: List[Tuple[str, float, int]] = []
+        page_keys_by_uri: Dict[str, set] = {}
+        current_topk_uris: set = set()
+        page_size = max(limit * 2, 20)
 
         # Add initial candidates that match the requested level.
         if initial_candidates:
@@ -470,7 +609,15 @@ class HierarchicalRetriever:
                         )
                         continue
                     r["_final_score"] = score
-                    collected_by_uri[uri] = r
+                    if skill_resolver and r.get("context_type") == ContextType.SKILL.value:
+                        key = candidate_key(r)
+                        previous = collected_by_uri.get(key)
+                        if previous is None or score > previous.get("_final_score", 0):
+                            collected_by_uri[key] = r
+                    else:
+                        # Preserve the original overwrite order for other types.
+                        collected_by_uri[uri] = r
+                    has_skill |= r.get("context_type") == ContextType.SKILL.value
                     logger.debug(
                         f"[RecursiveSearch] Added initial candidate: {uri} (score: {score:.4f})"
                     )
@@ -481,7 +628,8 @@ class HierarchicalRetriever:
         for uri, score in starting_points:
             heapq.heappush(dir_queue, (-score, uri))
 
-        async def search_children(current_uri: str) -> List[Dict[str, Any]]:
+        async def search_children(current_uri: str, offset: int = 0) -> List[Dict[str, Any]]:
+            paging = {"offset": offset} if offset else {}
             return await vector_proxy.search_children_in_tenant(
                 parent_uri=current_uri,
                 query_vector=query_vector,
@@ -489,13 +637,14 @@ class HierarchicalRetriever:
                 context_type=context_type,
                 target_directories=target_dirs,
                 extra_filter=scope_dsl,
-                limit=max(limit * 2, 20),
+                limit=page_size,
+                **paging,
             )
 
         parallelism = max(1, self.MAX_PARALLEL_CHILD_SEARCHES)
 
-        while dir_queue:
-            batch: List[Tuple[str, float]] = []
+        while dir_queue or (pending_pages and len(current_topk_uris) < limit):
+            batch: List[Tuple[str, float, int]] = []
             while dir_queue and len(batch) < parallelism:
                 temp_score, current_uri = heapq.heappop(dir_queue)
                 current_score = -temp_score
@@ -503,23 +652,44 @@ class HierarchicalRetriever:
                     continue
                 visited.add(current_uri)
                 logger.info(f"[RecursiveSearch] Entering URI: {current_uri}")
-                batch.append((current_uri, current_score))
+                batch.append((current_uri, current_score, 0))
+
+            if not batch and pending_pages and len(current_topk_uris) < limit:
+                batch = pending_pages[:parallelism]
+                del pending_pages[:parallelism]
 
             if not batch:
                 continue
 
             batch_results = await asyncio.gather(
-                *(search_children(current_uri) for current_uri, _ in batch)
+                *(search_children(current_uri, offset) for current_uri, _, offset in batch)
             )
 
             telemetry = get_current_telemetry()
-            for (_, current_score), results in zip(batch, batch_results, strict=True):
+            for (current_uri, current_score, offset), results in zip(
+                batch, batch_results, strict=True
+            ):
                 telemetry.count("vector.searches", 1)
                 telemetry.count("vector.scored", len(results))
                 telemetry.count("vector.scanned", len(results))
 
                 if not results:
                     continue
+
+                if skill_resolver and (
+                    offset or any(item.get("context_type") == "skill" for item in results)
+                ):
+                    keys = {candidate_key(item) for item in results}
+                    seen = page_keys_by_uri.setdefault(current_uri, set())
+                    if offset and keys <= seen:
+                        raise RuntimeError(
+                            "Skill search pagination did not advance; results are incomplete"
+                        )
+                    seen.update(keys)
+                    if len(results) >= page_size:
+                        pending_pages.append((current_uri, current_score, offset + len(results)))
+                if offset:
+                    results = [item for item in results if item.get("context_type") == "skill"]
 
                 query_scores = [self._finite_score(r.get("_score", 0.0)) for r in results]
                 if self._rerank_client and mode == RetrieverMode.THINKING:
@@ -528,6 +698,7 @@ class HierarchicalRetriever:
 
                 for r, score in zip(results, query_scores, strict=True):
                     uri = r.get("uri", "")
+                    has_skill |= r.get("context_type") == ContextType.SKILL.value
                     final_score = (
                         alpha * score + (1 - alpha) * current_score if current_score else score
                     )
@@ -541,10 +712,11 @@ class HierarchicalRetriever:
                     telemetry.count("vector.passed", 1)
                     if level is None or r.get("level", 2) in level:
                         # Deduplicate by URI and keep the highest-scored candidate.
-                        previous = collected_by_uri.get(uri)
+                        key = candidate_key(r) if skill_resolver else uri
+                        previous = collected_by_uri.get(key)
                         if previous is None or final_score > previous.get("_final_score", 0):
                             r["_final_score"] = final_score
-                            collected_by_uri[uri] = r
+                            collected_by_uri[key] = r
                             logger.debug(
                                 "[RecursiveSearch] Updated URI: %s candidate score to %.4f",
                                 uri,
@@ -556,12 +728,22 @@ class HierarchicalRetriever:
                         heapq.heappush(dir_queue, (-final_score, uri))
 
             # Convergence check after each parallel expansion round.
-            current_topk = sorted(
-                collected_by_uri.values(),
-                key=lambda x: x.get("_final_score", 0),
-                reverse=True,
-            )[:limit]
-            current_topk_uris = {c.get("uri", "") for c in current_topk}
+            if skill_resolver and has_skill:
+                current_matches = await self._convert_to_matched_contexts(
+                    list(collected_by_uri.values()), ctx=skill_resolver.ctx
+                )
+                grouped = await skill_resolver.resolve(current_matches)
+                current_topk_uris = {
+                    skill_root_uri(c.uri) if c.context_type == ContextType.SKILL else c.uri
+                    for c in grouped[:limit]
+                }
+            else:
+                current_topk = sorted(
+                    collected_by_uri.values(),
+                    key=lambda x: x.get("_final_score", 0),
+                    reverse=True,
+                )[:limit]
+                current_topk_uris = {c.get("uri", "") for c in current_topk}
             current_pool_size = len(collected_by_uri)
 
             if current_topk_uris == prev_topk_uris and len(current_topk_uris) >= limit:
@@ -572,7 +754,9 @@ class HierarchicalRetriever:
             elif current_pool_size == prev_pool_size:
                 stagnant_rounds += 1
 
-                if stagnant_rounds >= self.MAX_CONVERGENCE_ROUNDS:
+                if stagnant_rounds >= self.MAX_CONVERGENCE_ROUNDS and not (
+                    skill_resolver and has_skill and len(current_topk_uris) < limit
+                ):
                     break
             else:
                 convergence_rounds = 0
@@ -585,7 +769,7 @@ class HierarchicalRetriever:
             key=lambda x: x.get("_final_score", 0),
             reverse=True,
         )
-        return collected[:limit]
+        return collected if skill_resolver and has_skill else collected[:limit]
 
     async def _convert_to_matched_contexts(
         self,
@@ -647,9 +831,7 @@ class HierarchicalRetriever:
                     abstract=abstract,
                     category=c.get("category", ""),
                     score=final_score,
-                    search_tags=normalize_search_tags(
-                        c.get("search_tags"), discard_invalid=True
-                    ),
+                    search_tags=normalize_search_tags(c.get("search_tags"), discard_invalid=True),
                 )
             )
 

@@ -56,6 +56,7 @@ async def test_find_works_without_rerank_config(monkeypatch) -> None:
             score_threshold,
             scope_dsl,
             level,
+            skill_resolver,
         ):
             captured["typed_query"] = typed_query
             captured["ctx"] = ctx
@@ -64,6 +65,7 @@ async def test_find_works_without_rerank_config(monkeypatch) -> None:
             captured["score_threshold"] = score_threshold
             captured["scope_dsl"] = scope_dsl
             captured["level"] = level
+            assert skill_resolver.fs is fs
             return QueryResult(
                 query=typed_query,
                 matched_contexts=[
@@ -126,6 +128,7 @@ async def test_find_accepts_image_url_without_text_query(monkeypatch) -> None:
             score_threshold,
             scope_dsl,
             level,
+            skill_resolver,
         ):
             captured["typed_query"] = typed_query
             captured["mode"] = mode

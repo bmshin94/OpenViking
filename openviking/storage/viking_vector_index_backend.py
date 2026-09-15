@@ -1582,6 +1582,7 @@ class VikingVectorIndexBackend:
         target_directories: Optional[List[str]] = None,
         extra_filter: Optional[FilterExpr | Dict[str, Any]] = None,
         limit: int = 10,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         # TODO：Better Alternative to Current Temporary Fix
 
@@ -1608,6 +1609,7 @@ class VikingVectorIndexBackend:
                 extra_filter=extra_filter,
             ),
         )
+        paging = {"offset": offset} if offset else {}
         return await self.search(
             query_vector=query_vector,
             sparse_query_vector=sparse_query_vector,
@@ -1615,6 +1617,7 @@ class VikingVectorIndexBackend:
             limit=limit,
             output_fields=RETRIEVAL_OUTPUT_FIELDS,
             ctx=ctx,
+            **paging,
         )
 
     async def get_context_by_uri(

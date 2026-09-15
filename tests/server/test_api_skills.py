@@ -261,22 +261,23 @@ async def test_skills_api_update_rolls_back_when_replace_fails(client, monkeypat
         raise RuntimeError("source metadata write failed")
 
     monkeypatch.setattr(
-        "openviking.server.routers.skills.persist_skill_source_metadata",
+        "openviking.server.skill_source_metadata.write_skill_source_metadata",
         _fail_persist,
     )
 
-    with pytest.raises(RuntimeError, match="source metadata write failed"):
-        await client.put(
-            "/api/v1/skills/rollback-skill",
-            json={
-                "data": _skill_md(
-                    "rollback-skill",
-                    "Updated description",
-                    "This update should be rolled back.",
-                ),
-                "wait": True,
-            },
-        )
+    response = await client.put(
+        "/api/v1/skills/rollback-skill",
+        json={
+            "data": _skill_md(
+                "rollback-skill",
+                "Updated description",
+                "This update should be rolled back.",
+            ),
+            "wait": True,
+        },
+    )
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == "INTERNAL"
 
     show_response = await client.get(
         "/api/v1/skills/rollback-skill",
@@ -337,26 +338,27 @@ async def test_skills_api_update_restores_previous_privacy_on_failure(client, mo
         raise RuntimeError("source metadata write failed")
 
     monkeypatch.setattr(
-        "openviking.server.routers.skills.persist_skill_source_metadata",
+        "openviking.server.skill_source_metadata.write_skill_source_metadata",
         _fail_persist,
     )
 
-    with pytest.raises(RuntimeError, match="source metadata write failed"):
-        await client.put(
-            "/api/v1/skills/rollback-privacy-skill",
-            json={
-                "data": _skill_md(
-                    "rollback-privacy-skill",
-                    "Updated description",
-                    'api_key: "secret-new"\n',
-                ),
-                "wait": True,
-            },
-        )
+    response = await client.put(
+        "/api/v1/skills/rollback-privacy-skill",
+        json={
+            "data": _skill_md(
+                "rollback-privacy-skill",
+                "Updated description",
+                'api_key: "secret-new"\n',
+            ),
+            "wait": True,
+        },
+    )
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == "INTERNAL"
 
     privacy_response = await client.get("/api/v1/privacy-configs/skill/rollback-privacy-skill")
     assert privacy_response.status_code == 200, privacy_response.text
-    assert privacy_response.json()["result"]["values"]["api_key"] == "secret-old"
+    assert privacy_response.json()["result"]["current"]["values"]["api_key"] == "secret-old"
 
 
 async def test_skills_api_update_restores_previous_privacy_after_privacy_write(client, monkeypatch):
@@ -402,24 +404,25 @@ async def test_skills_api_update_restores_previous_privacy_after_privacy_write(c
     monkeypatch.setattr(SkillProcessor, "prepare_skill_privacy", _prepare_new_privacy)
     monkeypatch.setattr(SkillProcessor, "apply_skill_privacy", _apply_then_fail)
 
-    with pytest.raises(RuntimeError, match="privacy post-write failure"):
-        await client.put(
-            "/api/v1/skills/rollback-privacy-after-write-skill",
-            json={
-                "data": _skill_md(
-                    "rollback-privacy-after-write-skill",
-                    "Updated description",
-                    'api_key: "secret-new"\n',
-                ),
-                "wait": True,
-            },
-        )
+    response = await client.put(
+        "/api/v1/skills/rollback-privacy-after-write-skill",
+        json={
+            "data": _skill_md(
+                "rollback-privacy-after-write-skill",
+                "Updated description",
+                'api_key: "secret-new"\n',
+            ),
+            "wait": True,
+        },
+    )
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == "INTERNAL"
 
     privacy_response = await client.get(
         "/api/v1/privacy-configs/skill/rollback-privacy-after-write-skill"
     )
     assert privacy_response.status_code == 200, privacy_response.text
-    assert privacy_response.json()["result"]["values"]["api_key"] == "secret-old"
+    assert privacy_response.json()["result"]["current"]["values"]["api_key"] == "secret-old"
 
     show_response = await client.get(
         "/api/v1/skills/rollback-privacy-after-write-skill",
@@ -681,3 +684,56 @@ async def test_skills_api_validate_rfc_strict_and_loose_rules(client):
     long_body_result = long_body_response.json()["result"]
     assert long_body_result["valid"] is True
     assert any(issue["rule"] == "body_max_lines" for issue in long_body_result["warnings"])
+
+
+async def test_skill_package_indexes_nested_content_and_returns_actual_hit(client, tmp_path):
+    archive = tmp_path / "package-search.zip"
+    with zipfile.ZipFile(archive, "w") as package:
+        package.writestr("SKILL.md", _skill_md("package-search", "Root skill description"))
+        package.writestr("reference/nested/recovery.md", "Restore a backup in another region.")
+        package.writestr("reference/SKILL.md", _skill_md("attachment", "An ordinary attachment"))
+    with archive.open("rb") as handle:
+        uploaded = await client.post(
+            "/api/v1/resources/temp_upload",
+            files={"file": (archive.name, handle, "application/zip")},
+        )
+    assert uploaded.status_code == 200, uploaded.text
+    added = await client.post(
+        "/api/v1/skills",
+        json={"temp_file_id": uploaded.json()["result"]["temp_file_id"], "wait": True},
+    )
+    assert added.status_code == 200, added.text
+    root = added.json()["result"]["root_uri"]
+    for directory in (root, f"{root}/reference", f"{root}/reference/nested"):
+        for endpoint in ("abstract", "overview"):
+            content = await client.get(f"/api/v1/content/{endpoint}", params={"uri": directory})
+            assert content.status_code == 200, content.text
+            assert content.json()["result"]
+
+    for endpoint in ("/api/v1/skills/find", "/api/v1/search/find"):
+        found = await client.post(
+            endpoint,
+            json={
+                "query": "backup recovery",
+                "target_uri": f"{root}/reference/nested",
+                "level": [2],
+                "limit": 10,
+            },
+        )
+        assert found.status_code == 200, found.text
+        hits = found.json()["result"]["skills"]
+        assert len(hits) == 1
+        assert hits[0]["uri"] == f"{root}/reference/nested/recovery.md"
+        assert hits[0]["level"] == 2
+        assert "best_match" not in hits[0]
+        if endpoint == "/api/v1/skills/find":
+            assert hits[0]["root_uri"] == root
+            assert hits[0]["skill_md_uri"] == f"{root}/SKILL.md"
+            assert hits[0]["description"] == "Root skill description"
+
+    listed = await client.get("/api/v1/skills")
+    assert [skill["name"] for skill in listed.json()["result"]["skills"]] == ["package-search"]
+    deleted = await client.delete("/api/v1/skills/package-search")
+    assert deleted.status_code == 200, deleted.text
+    found = await client.post("/api/v1/skills/find", json={"query": "backup recovery"})
+    assert found.json()["result"]["skills"] == []
