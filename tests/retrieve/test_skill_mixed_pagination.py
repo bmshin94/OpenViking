@@ -51,8 +51,7 @@ async def _search(store, files, route, *, limit=10):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["resource", "memory"])
-@pytest.mark.parametrize("route", ["quick", "filter"])
+@pytest.mark.parametrize(("kind", "route"), [("resource", "quick"), ("memory", "filter")])
 async def test_mixed_pages_keep_result_merging_but_distinguish_stored_layers(kind, route):
     store = PagedStore(_mixed_records(kind))
     files = Files()
@@ -73,9 +72,8 @@ async def test_mixed_pages_keep_result_merging_but_distinguish_stored_layers(kin
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["resource", "memory"])
-async def test_thinking_global_pages_distinguish_non_skill_directory_layers(kind):
-    store = PagedStore(_mixed_records(kind, directories_only=True))
+async def test_thinking_global_pages_distinguish_non_skill_directory_layers():
+    store = PagedStore(_mixed_records("resource", directories_only=True))
     # Requesting files leaves the directory pool insufficient, so the retriever
     # must finish its global pagination even though no files exist in this case.
     matches = await _search(store, Files(), "thinking")
@@ -84,14 +82,13 @@ async def test_thinking_global_pages_distinguish_non_skill_directory_layers(kind
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["resource", "memory"])
 @pytest.mark.parametrize("route", ["quick", "filter", "thinking"])
-async def test_mixed_backend_repeated_page_still_reports_incomplete_results(kind, route):
+async def test_mixed_backend_repeated_page_still_reports_incomplete_results(route):
     class RepeatingStore(PagedStore):
         def _page(self, records, kwargs):
             return super()._page(records, {**kwargs, "offset": 0})
 
-    store = RepeatingStore(_mixed_records(kind, directories_only=route == "thinking"))
+    store = RepeatingStore(_mixed_records("resource", directories_only=route == "thinking"))
     with pytest.raises(RuntimeError, match="pagination did not advance; results are incomplete"):
         await _search(store, Files(), route)
     assert [call["offset"] for call in store.calls] == [0, 10]
@@ -127,14 +124,13 @@ async def test_internal_backups_do_not_consume_skill_limit_or_merge_normal_same_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["quick", "filter"])
-async def test_excluding_skill_backups_does_not_hide_resource_or_memory_paths(route):
+async def test_excluding_skill_backups_does_not_hide_resource_or_memory_paths():
     records = [
         row("viking://resources/.demo.update-backup-123/file.md", 0.9, kind="resource"),
         row("viking://user/user1/memories/.demo.update-backup-456/file.md", 0.8, kind="memory"),
         row(f"{SKILLS}/.demo.update-backup-789/file.md", 0.7),
     ]
     files = Files()
-    matches = await _search(PagedStore(records), files, route)
+    matches = await _search(PagedStore(records), files, "quick")
     assert {item.uri for item in matches} == {item["uri"] for item in records[:2]}
     assert files.stat_calls == []

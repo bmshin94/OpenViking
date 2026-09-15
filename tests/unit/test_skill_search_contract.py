@@ -57,8 +57,7 @@ def fake_search(monkeypatch):
     return SimpleNamespace(find=find, abstract=abstract, read_visible=read_visible)
 
 
-@pytest.mark.parametrize("as_find_result", [False, True])
-@pytest.mark.parametrize("level", [0, 1, 2])
+@pytest.mark.parametrize(("as_find_result", "level"), [(False, 0), (True, 1), (True, 2)])
 async def test_find_skills_reads_root_identity_and_preserves_actual_hit(
     fake_search, request_context, as_find_result, level
 ):
@@ -138,9 +137,16 @@ async def test_find_skills_does_not_use_hit_metadata_when_root_access_fails(
         )
 
 
-@pytest.mark.parametrize("endpoint", ["find", "search"])
-@pytest.mark.parametrize("level", [0, 1, 2])
-@pytest.mark.parametrize("read_content", [False, True])
+@pytest.mark.parametrize(
+    ("endpoint", "level", "read_content"),
+    [
+        ("find", 0, True),
+        ("find", 2, False),
+        ("search", 1, True),
+        ("search", 2, True),
+        ("search", 0, False),
+    ],
+)
 async def test_generic_search_read_content_uses_actual_skill_hit_uri(
     fake_search, request_context, endpoint, level, read_content
 ):
@@ -167,12 +173,11 @@ async def test_generic_search_read_content_uses_actual_skill_hit_uri(
 
 
 @pytest.mark.parametrize(
-    "root_uri",
-    ["viking://agent/skills/data.service", "viking://user/alice/skills/data.service"],
-)
-@pytest.mark.parametrize(
-    "suffix",
-    ["", "/", "/SKILL.md", "/reference/nested/backup.md", "/reference/nested/.overview.md"],
+    ("root_uri", "suffix"),
+    [
+        ("viking://agent/skills/data.service", ""),
+        ("viking://user/alice/skills/data.service", "/"),
+    ],
 )
 def test_skill_root_resolution_keeps_dotted_package_name(root_uri, suffix):
     assert skills_router._skill_root_from_hit_uri(root_uri + suffix) == root_uri

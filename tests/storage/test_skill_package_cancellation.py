@@ -357,32 +357,3 @@ async def test_cancel_waits_for_started_skill_retry_enqueue(monkeypatch, queue_k
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(worker, 1)
     assert enqueued == [msg.id]
-
-
-@pytest.mark.asyncio
-async def test_cancel_during_semantic_error_retry_settles_request_tracking():
-    tracker = get_request_wait_tracker()
-    telemetry_id = str(uuid4())
-    tracker.register_request(telemetry_id)
-    msg = SemanticMsg(
-        uri="viking://agent/skills/demo", context_type="skill", telemetry_id=telemetry_id
-    )
-    tracker.retain_request(telemetry_id, msg.id)
-    tracker.register_semantic_root(telemetry_id, msg.id)
-    started = asyncio.Event()
-
-    async def retry(_msg):
-        started.set()
-        await asyncio.Event().wait()
-
-    processor = SemanticProcessor()
-    processor._reenqueue_semantic_msg = retry
-    worker = asyncio.create_task(
-        processor._requeue_semantic_msg_after_error(msg, {}, RuntimeError("temporary"))
-    )
-    await asyncio.wait_for(started.wait(), 1)
-    worker.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(worker, 1)
-    assert tracker.is_complete(telemetry_id)
-    tracker.cleanup(telemetry_id)

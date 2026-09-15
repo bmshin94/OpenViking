@@ -11,6 +11,7 @@ import pytest
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from tests.server.test_api_skills import _add_skill, _skill_md
 from tests.server.test_api_skills import _stub_mcp_endpoint as _stub_mcp_endpoint
 from tests.server.test_skill_update_cancellation import _download, _wait_until
@@ -101,10 +102,13 @@ async def test_update_timeout_cancels_retry_wait_and_releases_its_retained_lock(
     _fail_first_run(monkeypatch, root)
     retry_started = threading.Event()
     retry_cancelled = threading.Event()
+    telemetry_id = None
     original_retry = SemanticProcessor._reenqueue_semantic_msg
 
     async def pause_retry(self, msg, **kwargs):
+        nonlocal telemetry_id
         if msg.uri == root:
+            telemetry_id = msg.telemetry_id
             assert kwargs["skill_lock"].lock is not None
             retry_started.set()
             try:
@@ -126,6 +130,8 @@ async def test_update_timeout_cancels_retry_wait_and_releases_its_retained_lock(
         response = await asyncio.wait_for(updating, 10)
         assert response.status_code == 504, response.text
         assert retry_cancelled.is_set()
+        assert telemetry_id is not None
+        await _wait_until(lambda: not get_request_wait_tracker().has_request(telemetry_id))
         assert await _download(client, f"{root}/SKILL.md") == old_content
         await _assert_unlocked(service.viking_fs, root)
     finally:

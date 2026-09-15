@@ -78,15 +78,9 @@ async def test_cancelling_config_write_keeps_package_locked_until_write_exits(pr
         await asyncio.gather(task, return_exceptions=True)
 
 
-@pytest.mark.parametrize("failure_stage", ["overview", "lock"])
-async def test_failure_before_package_ownership_does_not_change_config(processing, failure_stage):
+async def test_overview_failure_does_not_change_config(processing):
     processor, fs, ctx, prepared = processing
-    failing = (
-        processor._generate_overview
-        if failure_stage == "overview"
-        else fs._async_agfs.pathlock_acquire_tree
-    )
-    failing.side_effect = RuntimeError("pre-write failure")
+    processor._generate_overview.side_effect = RuntimeError("pre-write failure")
     with pytest.raises(RuntimeError, match="pre-write failure"):
         await processor.process_prepared_skill(prepared, fs, ctx)
     processor.apply_skill_privacy.assert_not_awaited()

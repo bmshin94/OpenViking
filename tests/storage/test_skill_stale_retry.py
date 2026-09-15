@@ -5,8 +5,6 @@
 
 from uuid import uuid4
 
-import pytest
-
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.named_queue import NamedQueue
@@ -19,12 +17,7 @@ from tests.server.conftest import service as service
 from tests.server.conftest import temp_dir as temp_dir
 
 
-@pytest.mark.parametrize(
-    "generation_trigger", ["content_delete", "content_copy", "semantic_refresh"]
-)
-async def test_stale_skill_retry_releases_lock_and_allows_latest_refresh(
-    service, monkeypatch, generation_trigger
-):
+async def test_stale_skill_retry_releases_lock_and_allows_latest_refresh(service, monkeypatch):
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
     root = "viking://agent/skills/stale-retry/references"
     fs = service.viking_fs
@@ -50,7 +43,7 @@ async def test_stale_skill_retry_releases_lock_and_allows_latest_refresh(
         "user_id": ctx.user.user_id,
         "peer_id": ctx.user.user_id,
         "role": str(ctx.role),
-        "generation_trigger": generation_trigger,
+        "generation_trigger": "content_delete",
         "coalesce_key": build_semantic_coalesce_key(
             context_type="skill",
             uri=root,

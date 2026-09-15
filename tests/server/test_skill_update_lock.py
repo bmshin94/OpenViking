@@ -4,14 +4,11 @@
 """Check update lock continuity using the real filesystem and HTTP endpoints."""
 
 import asyncio
-import threading
 
 import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.errors import LockAcquisitionError
-from openviking.storage.queuefs import get_queue_manager
-from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.utils.skill_processor import SkillProcessor
 from openviking_cli.session.user_id import UserIdentifier
 from tests.server.test_api_skills import _add_skill, _skill_md
@@ -134,7 +131,8 @@ async def test_restore_index_failure_preserves_live_lock_and_backup(client, serv
     # Generic cp/mv cleanup would remove the live root when vector restore fails.
     assert await _download(client, f"{root}/SKILL.md") == old_content
     assert await _download(client, f"{backup}/SKILL.md") == old_content
-    assert await _indexed_record(client, backup, 0)
+    # Internal backups are hidden from public search; inspect their stored vectors.
+    assert await fs.vector_store.get_context_by_uri(backup, level=0, ctx=_ctx())
 
 
 async def test_backup_copy_failure_keeps_original_package_and_lock(client, service, monkeypatch):
@@ -193,40 +191,3 @@ async def test_partial_content_cleanup_failure_restores_under_same_lock(
     assert response.status_code == 500, response.text
     assert await _download(client, f"{root}/SKILL.md") == old_content
     assert await _indexed_record(client, root, 0) == old_index
-
-
-async def test_wait_false_keeps_background_lock_after_request_releases_it(
-    client, service, monkeypatch
-):
-    name = "background-update-lock"
-    root = (await _add_skill(client, name, "Original"))["root_uri"]
-    fs = service.viking_fs
-    hidden_uri = f"{root}/.old-source.json"
-    await fs.write_file(hidden_uri, "old metadata", ctx=_ctx())
-    resume = threading.Event()
-    original_summary = SemanticProcessor._generate_single_file_summary
-
-    async def hold_summary(self, *args, **kwargs):
-        while not resume.is_set():
-            await asyncio.sleep(0.01)
-        return await original_summary(self, *args, **kwargs)
-
-    monkeypatch.setattr(SemanticProcessor, "_generate_single_file_summary", hold_summary)
-    try:
-        response = await client.put(
-            f"/api/v1/skills/{name}",
-            json={"data": _skill_md(name, "Replacement"), "wait": False},
-        )
-        assert response.status_code == 200, response.text
-        assert response.json()["result"]["task_id"]
-        await _assert_locked(fs, root)
-        assert not await fs.exists(hidden_uri, ctx=_ctx())
-        resume.set()
-        await get_queue_manager().wait_complete(timeout=5)
-        shown = await client.get(f"/api/v1/skills/{name}")
-        assert shown.json()["result"]["description"] == "Replacement"
-        lease = await fs._async_agfs.pathlock_acquire_tree(fs._uri_to_path(root, ctx=_ctx()))
-        await fs._async_agfs.pathlock_release(lease)
-    finally:
-        resume.set()
-        await get_queue_manager().wait_complete(timeout=5)

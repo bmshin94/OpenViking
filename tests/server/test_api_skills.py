@@ -4,6 +4,7 @@
 import sys
 import types
 import zipfile
+from unittest.mock import AsyncMock
 
 import pytest
 from starlette.responses import PlainTextResponse
@@ -362,9 +363,14 @@ async def test_skills_api_update_restores_previous_privacy_on_failure(client, mo
 
 
 async def test_skills_api_update_restores_previous_privacy_after_privacy_write(client, monkeypatch):
+    from openviking.storage.queuefs import get_queue_manager
     from openviking.utils.skill_processor import SkillProcessor
 
     await _add_skill(client, "rollback-privacy-after-write-skill", "Original description")
+    queue_manager = get_queue_manager()
+    queue = queue_manager.get_queue(queue_manager.SEMANTIC)
+    enqueue = AsyncMock(wraps=queue.enqueue)
+    monkeypatch.setattr(queue, "enqueue", enqueue)
 
     seeded_privacy = await client.post(
         "/api/v1/privacy-configs/skill/rollback-privacy-after-write-skill",
@@ -372,6 +378,9 @@ async def test_skills_api_update_restores_previous_privacy_after_privacy_write(c
     )
     assert seeded_privacy.status_code == 200, seeded_privacy.text
 
+    before = (await client.get("/api/v1/skills/rollback-privacy-after-write-skill")).json()[
+        "result"
+    ]
     original_prepare = SkillProcessor.prepare_skill_privacy
     original_apply = SkillProcessor.apply_skill_privacy
 
@@ -419,6 +428,7 @@ async def test_skills_api_update_restores_previous_privacy_after_privacy_write(c
     )
     assert response.status_code == 500, response.text
     assert response.json()["error"]["code"] == "INTERNAL"
+    enqueue.assert_not_awaited()
 
     privacy_response = await client.get(
         "/api/v1/privacy-configs/skill/rollback-privacy-after-write-skill"
@@ -432,7 +442,8 @@ async def test_skills_api_update_restores_previous_privacy_after_privacy_write(c
     )
     assert show_response.status_code == 200, show_response.text
     shown = show_response.json()["result"]
-    assert shown["description"] == "Original description"
+    for field in ("description", "abstract", "overview", "content"):
+        assert shown[field] == before[field]
     assert "secret-new" not in shown["content"]
 
 

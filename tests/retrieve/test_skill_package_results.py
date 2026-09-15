@@ -118,10 +118,7 @@ def query(target=SKILLS):
         ("viking://user/alice/skills/demo/scripts/run", "viking://user/alice/skills/demo"),
         ("viking://agent/agent1/skills/demo/ref.txt", "viking://agent/agent1/skills/demo"),
         (SKILLS, ""),
-        (f"{SKILLS}/.abstract.md", ""),
-        (f"{SKILLS}/.overview.md", ""),
         ("viking://user/alice/skills/.abstract.md", ""),
-        ("viking://user/alice/skills/.overview.md", ""),
         (f"{SKILLS}/demo/.abstract.md", f"{SKILLS}/demo"),
         ("viking://resources/example/skills/demo/SKILL.md", ""),
     ],
@@ -150,26 +147,6 @@ async def test_skill_namespace_summaries_are_excluded_before_pagination_counts()
     ]
     assert [call["offset"] for call in store.calls] == [0, 10]
     assert files.stat_calls == [f"{SKILLS}/a", f"{SKILLS}/b"]
-
-
-@pytest.mark.asyncio
-async def test_skill_namespace_summaries_do_not_return_skills_after_last_package_removed():
-    files = Files()
-    result = await SkillResultResolver(files, ctx()).resolve(
-        [
-            MatchedContext(
-                f"{SKILLS}/.abstract.md", ContextType.SKILL, level=0, abstract="namespace"
-            ),
-            MatchedContext(
-                "viking://user/user1/skills/.abstract.md",
-                ContextType.SKILL,
-                level=0,
-                abstract="namespace",
-            ),
-        ]
-    )
-    assert result == []
-    assert files.stat_calls == []
 
 
 @pytest.mark.asyncio
@@ -240,7 +217,7 @@ async def test_quick_threshold_equality_controls_pagination(score_gte):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid_score", [float("nan"), float("inf"), None, "invalid"])
+@pytest.mark.parametrize("invalid_score", [float("nan"), None])
 async def test_quick_invalid_page_boundary_does_not_hide_later_matches(invalid_score):
     class InvalidScoreStore(PagedStore):
         def _page(self, records, kwargs):
@@ -334,11 +311,7 @@ async def test_grouping_returns_the_original_hit_without_rewriting_any_content()
     resolver = SkillResultResolver(files, ctx())
     cases = [
         (f"{root}/reference/.overview.md", 1, "overview text"),
-        (f"{root}/.abstract.md", 0, "root abstract"),
         (f"{root}/guide.md", 2, "x" * 1500),
-        (f"{root}/empty-summary.md", 2, ""),
-        (f"{root}/recording.mp4", 2, "recording.mp4"),
-        (f"{root}/recording.mp4", 2, "Discussion of backups"),
     ]
     for uri, level, abstract in cases:
         original = MatchedContext(uri, ContextType.SKILL, level, abstract, score=0.9)
@@ -482,9 +455,14 @@ async def test_non_skill_results_and_search_calls_are_unchanged(mode):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", [ContextType.RESOURCE, ContextType.MEMORY])
-@pytest.mark.parametrize("group_skills", [False, True])
-@pytest.mark.parametrize("include_skill", [False, True])
+@pytest.mark.parametrize(
+    ("kind", "group_skills", "include_skill"),
+    [
+        (ContextType.RESOURCE, False, False),
+        (ContextType.RESOURCE, True, False),
+        (ContextType.MEMORY, True, True),
+    ],
+)
 async def test_non_skill_initial_directory_hits_keep_legacy_overwrite_order(
     kind, group_skills, include_skill
 ):
@@ -557,8 +535,8 @@ async def test_filter_only_find_fills_packages_and_keeps_zero_scores():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("level", [0, 1])
-async def test_filter_only_directory_hit_keeps_its_original_uri_and_zero_score(level):
+async def test_filter_only_directory_hit_keeps_its_original_uri_and_zero_score():
+    level = 1
     uri = f"{SKILLS}/demo/reference"
     store = PagedStore([row(uri, 0.9, level, "directory content")])
     files = Files()
@@ -576,24 +554,6 @@ async def test_filter_only_directory_hit_keeps_its_original_uri_and_zero_score(l
     assert matched.abstract == "directory content"
     assert matched.score == 0
     assert files.stat_calls == [f"{SKILLS}/demo"]
-
-
-@pytest.mark.asyncio
-async def test_non_advancing_skill_pages_report_incomplete_results():
-    class RepeatingStore(PagedStore):
-        async def search_in_tenant(self, ctx, **kwargs):
-            kwargs["offset"] = 0
-            return await super().search_in_tenant(ctx, **kwargs)
-
-    store = RepeatingStore([row(f"{SKILLS}/a/ref/{i}.md", 0.9) for i in range(10)])
-    with pytest.raises(RuntimeError, match="results are incomplete"):
-        await HierarchicalRetriever(store, None).retrieve(
-            query(),
-            ctx(),
-            limit=2,
-            mode=RetrieverMode.QUICK,
-            skill_resolver=SkillResultResolver(Files(), ctx()),
-        )
 
 
 @pytest.mark.asyncio

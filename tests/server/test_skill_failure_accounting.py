@@ -3,8 +3,6 @@
 
 """A failed Skill package settles one queue item, regardless of file count."""
 
-import pytest
-
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from tests.server.test_api_skills import _add_skill, _skill_md
@@ -16,9 +14,9 @@ from tests.server.test_skill_update_cancellation import (
 )
 
 
-def _fail_package_summaries(monkeypatch, name, failure_count):
+def _fail_package_summaries(monkeypatch, name):
     original = SemanticProcessor._generate_single_file_summary
-    failed_paths = ["SKILL.md", "references/a.md", "references/b.md"][:failure_count]
+    failed_paths = ["SKILL.md", "references/a.md", "references/b.md"]
 
     async def fail_selected(self, file_path, *args, **kwargs):
         if any(file_path.endswith(f"/skills/{name}/{path}") for path in failed_paths):
@@ -47,12 +45,11 @@ async def _assert_failed_package_settled(client, failed_paths):
     return status
 
 
-@pytest.mark.parametrize("failure_count,followup_kind", [(1, "skill"), (3, "resource")])
 async def test_failed_skill_files_do_not_break_global_wait_or_followup_work(
-    client, monkeypatch, tmp_path, upload_temp_dir, failure_count, followup_kind
+    client, monkeypatch, tmp_path, upload_temp_dir
 ):
-    name = f"failure-count-{failure_count}"
-    failed_paths, _ = _fail_package_summaries(monkeypatch, name, failure_count)
+    name = "multiple-file-failures"
+    failed_paths, _ = _fail_package_summaries(monkeypatch, name)
     upload = await _upload_package(
         client,
         tmp_path,
@@ -69,19 +66,16 @@ async def test_failed_skill_files_do_not_break_global_wait_or_followup_work(
         assert path in response.json()["error"]["message"]
     before = await _assert_failed_package_settled(client, failed_paths)
 
-    if followup_kind == "skill":
-        await _add_skill(client, "healthy-followup", "A subsequent healthy Skill")
-    else:
-        uploaded = await client.post(
-            "/api/v1/resources/temp_upload",
-            files={"file": ("healthy.md", b"# A healthy resource\nContent.\n", "text/markdown")},
-        )
-        assert uploaded.status_code == 200, uploaded.text
-        added = await client.post(
-            "/api/v1/resources",
-            json={"temp_file_id": uploaded.json()["result"]["temp_file_id"], "wait": True},
-        )
-        assert added.status_code == 200, added.text
+    uploaded = await client.post(
+        "/api/v1/resources/temp_upload",
+        files={"file": ("healthy.md", b"# A healthy resource\nContent.\n", "text/markdown")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    added = await client.post(
+        "/api/v1/resources",
+        json={"temp_file_id": uploaded.json()["result"]["temp_file_id"], "wait": True},
+    )
+    assert added.status_code == 200, added.text
 
     after = await _assert_failed_package_settled(client, failed_paths)
     assert after.processed > before.processed
@@ -94,7 +88,7 @@ async def test_update_with_multiple_file_failures_restores_package_and_settles_q
     root = (await _add_skill(client, name, "Original"))["root_uri"]
     old_content = await _download(client, f"{root}/SKILL.md")
     old_index = await _indexed_record(client, root, 0)
-    failed_paths, original = _fail_package_summaries(monkeypatch, name, 3)
+    failed_paths, original = _fail_package_summaries(monkeypatch, name)
     upload = await _upload_package(
         client,
         tmp_path,

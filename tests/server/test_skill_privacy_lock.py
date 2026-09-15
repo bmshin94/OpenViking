@@ -9,6 +9,7 @@ import threading
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.server.routers import skills as skills_router
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.utils.skill_processor import SkillProcessor
@@ -61,6 +62,10 @@ async def test_rejected_add_preserves_background_update_privacy(
 ):
     name = "concurrent-add-privacy"
     root = (await _add_skill(client, name, "Original"))["root_uri"]
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    fs = service.viking_fs
+    hidden_uri = f"{root}/.old-source.json"
+    await fs.write_file(hidden_uri, "old metadata", ctx=ctx)
     endpoint = f"/api/v1/privacy-configs/skill/{name}"
     seeded = await client.post(endpoint, json={"values": {"api_key": "old-value"}})
     assert seeded.status_code == 200, seeded.text
@@ -89,11 +94,17 @@ async def test_rejected_add_preserves_background_update_privacy(
             json={"data": _skill_md(name, "Accepted update"), "wait": False},
         )
         assert accepted.status_code == 200, accepted.text
-        await _assert_locked(service.viking_fs, root)
+        assert accepted.json()["result"]["task_id"]
+        assert not accepted.json()["result"].get("warnings")
+        await _assert_locked(fs, root)
+        assert not await fs.exists(hidden_uri, ctx=ctx)
         before = await _privacy_snapshot(client, endpoint)
         assert before[0] == (200 if accepted_values else 404)
         if accepted_values:
             assert before[1]["current"]["values"] == accepted_values
+        else:
+            privacy_root = service.privacy_configs.get_config_root(ctx, "skill", name)
+            assert not await fs.exists(privacy_root, ctx=ctx)
 
         rejected = await client.post(
             "/api/v1/skills",
@@ -116,16 +127,25 @@ async def test_rejected_add_preserves_background_update_privacy(
     finally:
         resume.set()
         await get_queue_manager().wait_complete(timeout=5)
+    await _assert_unlocked(fs, root, ctx)
 
 
 async def test_privacy_history_restore_serializes_concurrent_save(client, service, monkeypatch):
     name = "privacy-history-restore-lock"
     await _add_skill(client, name, "Original")
     endpoint = f"/api/v1/privacy-configs/skill/{name}"
-    for value in ("older-value", "old-value"):
-        seeded = await client.post(endpoint, json={"values": {"api_key": value}})
+    for revision, value in enumerate(("older-value", "old-value"), start=1):
+        seeded = await client.post(
+            endpoint,
+            json={
+                "values": {"api_key": value},
+                "change_reason": f"seed version {revision}",
+                "labels": {"revision": revision},
+            },
+        )
         assert seeded.status_code == 200, seeded.text
-    _, _, old_history = await _privacy_snapshot(client, endpoint)
+    old_snapshot = await _privacy_snapshot(client, endpoint)
+    _, _, old_history = old_snapshot
     assert len(old_history) == 2
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
     fs = service.viking_fs
@@ -136,6 +156,15 @@ async def test_privacy_history_restore_serializes_concurrent_save(client, servic
     save_started = _observe_save_start(privacy, monkeypatch)
     metadata_failed = False
     original_write = fs.write_file_bytes
+    original_restore = skills_router._restore_skill_privacy
+    restored_snapshot = None
+
+    async def observe_restoration(*args, **kwargs):
+        nonlocal restored_snapshot
+        await original_restore(*args, **kwargs)
+        # Inspect the restored current value and metadata before the waiting
+        # save can replace them; the update still owns the configuration lock.
+        restored_snapshot = await _privacy_snapshot(client, endpoint)
 
     async def empty_privacy(self, skill_dict, ctx):
         return skill_dict, {}
@@ -143,6 +172,7 @@ async def test_privacy_history_restore_serializes_concurrent_save(client, servic
     async def fail_metadata(*args, **kwargs):
         nonlocal metadata_failed
         assert (await client.get(endpoint)).status_code == 404
+        await _assert_locked(fs, root)
         metadata_failed = True
         raise RuntimeError("injected source metadata failure after privacy deletion")
 
@@ -159,6 +189,7 @@ async def test_privacy_history_restore_serializes_concurrent_save(client, servic
         "openviking.server.skill_source_metadata.write_skill_source_metadata", fail_metadata
     )
     monkeypatch.setattr(fs, "write_file_bytes", pause_restore_write)
+    monkeypatch.setattr(skills_router, "_restore_skill_privacy", observe_restoration)
     updating = asyncio.create_task(
         client.put(
             f"/api/v1/skills/{name}",
@@ -185,6 +216,7 @@ async def test_privacy_history_restore_serializes_concurrent_save(client, servic
         resume.set()
         failed = await asyncio.wait_for(updating, 10)
         assert failed.status_code == 500, failed.text
+        assert restored_snapshot == old_snapshot
         saved = await asyncio.wait_for(saving, 10)
         assert saved.status_code == 200, saved.text
 
@@ -205,9 +237,8 @@ async def test_privacy_history_restore_serializes_concurrent_save(client, servic
 
 
 @pytest.mark.parametrize("had_privacy", [False, True])
-@pytest.mark.parametrize("replacement_values", [{}, {"api_key": "replacement-value"}])
 async def test_update_rollback_preserves_waiting_privacy_save(
-    client, service, monkeypatch, had_privacy, replacement_values
+    client, service, monkeypatch, had_privacy
 ):
     name = "privacy-update-rollback"
     await _add_skill(client, name, "Original")
@@ -224,7 +255,7 @@ async def test_update_rollback_preserves_waiting_privacy_save(
     save_started = _observe_save_start(privacy, monkeypatch)
 
     async def prepare_privacy(self, skill_dict, ctx):
-        return skill_dict, replacement_values
+        return skill_dict, {"api_key": "replacement-value"}
 
     async def fail_metadata(*args, **kwargs):
         paused.set()

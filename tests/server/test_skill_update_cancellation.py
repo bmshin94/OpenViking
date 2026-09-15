@@ -7,9 +7,8 @@ import asyncio
 import threading
 import zipfile
 
-from openviking.storage.queuefs import QueueManager, get_queue_manager
+from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
-from openviking.utils.skill_processor import SkillProcessor
 from tests.server.test_api_skills import _add_skill, _skill_md
 from tests.server.test_api_skills import _stub_mcp_endpoint as _stub_mcp_endpoint
 
@@ -55,116 +54,6 @@ async def _indexed_record(client, uri, level):
     return [
         (hit["uri"], hit["level"], hit["abstract"]) for hit in response.json()["result"]["skills"]
     ]
-
-
-async def test_privacy_failure_restores_old_skill_before_background_enqueue(client, monkeypatch):
-    name = "sync-privacy-rollback"
-    queue = get_queue_manager().get_queue(QueueManager.SEMANTIC)
-    original_enqueue = queue.enqueue
-    enqueued = []
-
-    async def record_enqueue(msg):
-        enqueued.append(msg)
-        return await original_enqueue(msg)
-
-    monkeypatch.setattr(queue, "enqueue", record_enqueue)
-    await _add_skill(client, name, "Original description")
-    assert any(msg.context_type == "skill" and msg.uri.endswith(f"/{name}") for msg in enqueued)
-    enqueued.clear()
-    seeded = await client.post(
-        f"/api/v1/privacy-configs/skill/{name}",
-        json={"values": {"api_key": "old-value"}, "change_reason": "seed"},
-    )
-    assert seeded.status_code == 200, seeded.text
-    before = (await client.get(f"/api/v1/skills/{name}")).json()["result"]
-
-    original_apply = SkillProcessor.apply_skill_privacy
-
-    async def apply_then_fail(self, skill_dict, privacy_values, ctx, **kwargs):
-        await original_apply(self, skill_dict, {"api_key": "new-value"}, ctx, **kwargs)
-        raise RuntimeError("injected privacy failure")
-
-    monkeypatch.setattr(SkillProcessor, "apply_skill_privacy", apply_then_fail)
-    response = await client.put(
-        f"/api/v1/skills/{name}",
-        json={"data": _skill_md(name, "Replacement description"), "wait": False},
-    )
-    assert response.status_code == 500, response.text
-    assert enqueued == [], "A synchronous update failure must not leave background work"
-    shown = await client.get(f"/api/v1/skills/{name}")
-    assert shown.status_code == 200, shown.text
-    for field in ("description", "abstract", "overview", "content"):
-        assert shown.json()["result"][field] == before[field]
-    privacy = await client.get(f"/api/v1/privacy-configs/skill/{name}")
-    assert privacy.status_code == 200, privacy.text
-    assert privacy.json()["result"]["current"]["values"] == {"api_key": "old-value"}
-
-
-async def test_update_restores_all_deleted_privacy_versions_after_metadata_failure(
-    client, monkeypatch
-):
-    name = "deleted-privacy-history-rollback"
-    await _add_skill(client, name, "Original description")
-    privacy_uri = f"/api/v1/privacy-configs/skill/{name}"
-    for version in (1, 2):
-        seeded = await client.post(
-            privacy_uri,
-            json={
-                "values": {"api_key": f"test-only-value-{version}"},
-                "change_reason": f"seed version {version}",
-                "labels": {"revision": version},
-            },
-        )
-        assert seeded.status_code == 200, seeded.text
-
-    old_privacy = await client.get(privacy_uri)
-    assert old_privacy.status_code == 200, old_privacy.text
-    versions = await client.get(f"{privacy_uri}/versions")
-    assert versions.status_code == 200, versions.text
-    assert versions.json()["result"] == [1, 2]
-    snapshots = {}
-    for version in versions.json()["result"]:
-        snapshot = await client.get(f"{privacy_uri}/versions/{version}")
-        assert snapshot.status_code == 200, snapshot.text
-        snapshots[version] = snapshot.json()["result"]
-
-    async def prepare_without_privacy(self, skill_dict, ctx):
-        return skill_dict, {}
-
-    privacy_deleted_before_failure = False
-
-    async def fail_metadata(*args, **kwargs):
-        nonlocal privacy_deleted_before_failure
-        privacy_deleted_before_failure = (await client.get(privacy_uri)).status_code == 404
-        raise RuntimeError("injected source metadata failure after privacy deletion")
-
-    monkeypatch.setattr(SkillProcessor, "prepare_skill_privacy", prepare_without_privacy)
-    monkeypatch.setattr(
-        "openviking.server.skill_source_metadata.write_skill_source_metadata", fail_metadata
-    )
-    response = await client.put(
-        f"/api/v1/skills/{name}",
-        json={
-            "data": _skill_md(name, "Replacement description", "No private configuration."),
-            "wait": True,
-        },
-    )
-    assert response.status_code == 500, response.text
-    assert privacy_deleted_before_failure, "The fault must happen after deleting old privacy"
-
-    restored = await client.get(privacy_uri)
-    assert restored.status_code == 200, restored.text
-    assert restored.json()["result"] == old_privacy.json()["result"]
-    restored_versions = await client.get(f"{privacy_uri}/versions")
-    assert restored_versions.status_code == 200, restored_versions.text
-    assert restored_versions.json()["result"] == versions.json()["result"]
-    for version, snapshot in snapshots.items():
-        restored_snapshot = await client.get(f"{privacy_uri}/versions/{version}")
-        assert restored_snapshot.status_code == 200, restored_snapshot.text
-        assert restored_snapshot.json()["result"] == snapshot
-    shown = await client.get(f"/api/v1/skills/{name}")
-    assert shown.status_code == 200, shown.text
-    assert shown.json()["result"]["description"] == "Original description"
 
 
 async def test_update_timeout_cancels_unfinished_work_and_restores_package_and_index(
@@ -308,27 +197,3 @@ async def test_async_update_background_failure_keeps_successfully_returned_repla
     finally:
         release_failure.set()
         await get_queue_manager().wait_complete(timeout=5)
-
-
-async def test_update_reports_backup_restoration_failure(client, service, monkeypatch):
-    name = "failed-rollback-is-visible"
-    added = await _add_skill(client, name, "Original description")
-    root = added["root_uri"]
-    original_copy = service.viking_fs._copy_directory_under_tree_locks
-
-    async def fail_privacy(*args, **kwargs):
-        raise RuntimeError("injected privacy failure")
-
-    async def fail_backup_restore(*args, **kwargs):
-        if ".update-backup-" in kwargs["old_uri"] and kwargs["new_uri"] == root:
-            raise RuntimeError("injected backup restoration failure")
-        return await original_copy(*args, **kwargs)
-
-    monkeypatch.setattr(SkillProcessor, "apply_skill_privacy", fail_privacy)
-    monkeypatch.setattr(service.viking_fs, "_copy_directory_under_tree_locks", fail_backup_restore)
-    response = await client.put(
-        f"/api/v1/skills/{name}",
-        json={"data": _skill_md(name, "Replacement description"), "wait": False},
-    )
-    assert response.status_code == 500, response.text
-    assert "injected backup restoration failure" in response.text

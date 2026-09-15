@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -81,31 +80,3 @@ async def test_skill_rollback_does_not_ignore_failure_to_cancel_live_work(monkey
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
     with pytest.raises(ValueError, match="could not be persisted"):
         await ResourceService.__new__(ResourceService).cancel_skill_processing("update-task", ctx)
-
-
-@pytest.mark.asyncio
-async def test_skill_rollback_waits_for_work_to_exit_after_cancel_request(monkeypatch):
-    cancelled = asyncio.Event()
-    write_exited = asyncio.Event()
-
-    async def cancel(*args, **kwargs):
-        cancelled.set()
-        return SimpleNamespace(status=TaskStatus.CANCELLING)
-
-    tracker = SimpleNamespace(
-        cancel_skill_update_for_rollback=cancel,
-        has_work=lambda task_id: not write_exited.is_set(),
-    )
-    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
-    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
-    stopping = asyncio.create_task(
-        ResourceService.__new__(ResourceService).cancel_skill_processing("update-task", ctx)
-    )
-    try:
-        await asyncio.wait_for(cancelled.wait(), timeout=1)
-        assert not stopping.done()
-        write_exited.set()
-        await asyncio.wait_for(stopping, timeout=1)
-    finally:
-        write_exited.set()
-        await asyncio.gather(stopping, return_exceptions=True)

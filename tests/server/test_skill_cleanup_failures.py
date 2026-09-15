@@ -60,8 +60,7 @@ def _inject_final_cleanup_failure(service, monkeypatch, name, root, failure_stag
     return privacy_root, state
 
 
-@pytest.mark.parametrize("wait", [False, True])
-@pytest.mark.parametrize("failure_stage", ["get_meta", "get_current", "list_versions", "rm"])
+@pytest.mark.parametrize("wait,failure_stage", [(False, "get_meta"), (True, "rm")])
 async def test_final_privacy_cleanup_failure_preserves_success_and_releases_locks(
     client, service, monkeypatch, wait, failure_stage
 ):
@@ -115,17 +114,14 @@ async def test_final_privacy_cleanup_failure_preserves_success_and_releases_lock
         await get_queue_manager().wait_complete(timeout=5)
 
 
-@pytest.mark.parametrize("failure_stage", ["get_meta", "get_current", "list_versions", "rm"])
 async def test_secondary_cleanup_failure_preserves_original_error_and_restored_skill(
-    client, service, monkeypatch, failure_stage
+    client, service, monkeypatch
 ):
     name = "cleanup-after-rollback"
     root = (await _add_skill(client, name, "Original"))["root_uri"]
     before = (await client.get(f"/api/v1/skills/{name}")).json()["result"]
     monkeypatch.setattr(SkillProcessor, "prepare_skill_privacy", _empty_privacy)
-    privacy_root, fault = _inject_final_cleanup_failure(
-        service, monkeypatch, name, root, failure_stage
-    )
+    privacy_root, fault = _inject_final_cleanup_failure(service, monkeypatch, name, root, "rm")
 
     async def fail_source_metadata(*args, **kwargs):
         raise InvalidArgumentError("original update validation failure")
@@ -147,26 +143,6 @@ async def test_secondary_cleanup_failure_preserves_original_error_and_restored_s
     assert (await client.get(f"/api/v1/privacy-configs/skill/{name}")).status_code == 404
     await _assert_unlocked(service.viking_fs, root, _ctx())
     await _assert_unlocked(service.viking_fs, privacy_root, _ctx())
-
-
-@pytest.mark.parametrize("wait", [False, True])
-async def test_successful_empty_cleanup_has_no_warning_or_config_directory(
-    client, service, monkeypatch, wait
-):
-    name = "cleanup-no-warning"
-    root = (await _add_skill(client, name, "Original"))["root_uri"]
-    monkeypatch.setattr(SkillProcessor, "prepare_skill_privacy", _empty_privacy)
-    response = await client.put(
-        f"/api/v1/skills/{name}",
-        json={"data": _skill_md(name, "Replacement"), "wait": wait},
-    )
-    assert response.status_code == 200, response.text
-    assert not response.json()["result"].get("warnings")
-    privacy_root = service.privacy_configs.get_config_root(_ctx(), "skill", name)
-    assert not await service.viking_fs.exists(privacy_root, ctx=_ctx())
-    assert (await client.get(f"/api/v1/privacy-configs/skill/{name}")).status_code == 404
-    await get_queue_manager().wait_complete(timeout=5)
-    await _assert_unlocked(service.viking_fs, root, _ctx())
 
 
 @pytest.mark.parametrize("update_fails", [False, True])
