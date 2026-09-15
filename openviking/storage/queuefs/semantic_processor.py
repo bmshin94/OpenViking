@@ -212,7 +212,9 @@ class SemanticProcessor(DequeueHandlerBase):
         # Default to other
         return FILE_TYPE_OTHER
 
-    async def _reenqueue_semantic_msg(self, msg: SemanticMsg) -> None:
+    async def _reenqueue_semantic_msg(
+        self, msg: SemanticMsg, *, skill_lock: Optional[SemanticLockScope] = None
+    ) -> None:
         """Re-enqueue a semantic message for later processing.
 
         Throttles with a sleep when the circuit breaker is open to prevent
@@ -231,21 +233,52 @@ class SemanticProcessor(DequeueHandlerBase):
         if queue_manager is not None:
             semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC)
             if msg.context_type == "skill":
-                await run_to_completion(lambda: semantic_queue.enqueue(msg))
+                if skill_lock is not None and skill_lock.lock is not None and skill_lock._owned:
+                    await run_to_completion(
+                        lambda: self._enqueue_skill_retry(semantic_queue, msg, skill_lock)
+                    )
+                else:
+                    await run_to_completion(lambda: semantic_queue.enqueue(msg))
             else:
                 await semantic_queue.enqueue(msg)
             logger.info(f"Re-enqueued semantic message: {msg.uri}")
         else:
             logger.warning(f"No queue manager available, cannot re-enqueue: {msg.uri}")
 
+    async def _enqueue_skill_retry(self, queue, msg: SemanticMsg, scope: SemanticLockScope) -> None:
+        """Transfer the live package lease to a retry before releasing this worker.
+
+        Reusing the consumed handoff would require acquiring an unrelated lock,
+        which conflicts with an update request still waiting under its outer lease.
+        """
+        agfs = get_viking_fs()._async_agfs
+        handoff = await agfs.pathlock_to_handoff(scope.lock)
+        handed_off = False
+        try:
+            await agfs.pathlock_handoff(scope.lock)
+            handed_off = True
+            scope._owned = False
+            msg.lock_handoff = handoff
+            await queue.enqueue(msg)
+        except BaseException:
+            if handed_off:
+                scope.lock = await agfs.pathlock_adopt(handoff)
+                scope._owned = True
+            raise
+
     async def _requeue_semantic_msg_after_error(
         self,
         msg: SemanticMsg,
         data: Optional[Dict[str, Any]],
         error: Exception,
+        *,
+        skill_lock: Optional[SemanticLockScope] = None,
     ) -> None:
         try:
-            await self._reenqueue_semantic_msg(msg)
+            if skill_lock is not None:
+                await self._reenqueue_semantic_msg(msg, skill_lock=skill_lock)
+            else:
+                await self._reenqueue_semantic_msg(msg)
             self._merge_request_stats(msg.telemetry_id, requeue_count=1)
             get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
             self.report_requeue()
@@ -361,6 +394,8 @@ class SemanticProcessor(DequeueHandlerBase):
         collector = None
         internal_skill_tracking = False
         skill_lock_started = False
+        semantic_lock = None
+        skill_lock_closed = False
         try:
             import json
 
@@ -414,6 +449,10 @@ class SemanticProcessor(DequeueHandlerBase):
                         msg.uri,
                         msg.coalesce_version,
                     )
+                    if msg.context_type == "skill" and msg.lock_handoff is not None:
+                        # A superseded retry can still own a handed-off lease.
+                        # Drop its ownership before acknowledging skipped work.
+                        await run_to_completion(lambda: self._release_cancelled_semantic_lock(msg))
                     if msg.telemetry_id and msg.id:
                         get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
                     self.report_success()
@@ -472,6 +511,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                 msg.uri, ctx=current_ctx
                             ),
                         )
+                    processing_succeeded = False
                     try:
                         # Regular memory writes keep their specialized update path.
                         # Callers must explicitly opt into directory aggregation; the
@@ -578,20 +618,23 @@ class SemanticProcessor(DequeueHandlerBase):
                                     target_uri or msg.uri,
                                     l0_body_changed=write_result.abstract_body_changed,
                                 )
+                        processing_succeeded = True
                     finally:
                         if msg.context_type == "skill":
 
                             async def finish_skill_work():
-                                try:
-                                    if not msg.skip_vectorization:
-                                        await get_request_wait_tracker().wait_for_embeddings(
-                                            msg.telemetry_id
-                                        )
-                                finally:
+                                nonlocal skill_lock_closed
+                                if not msg.skip_vectorization:
+                                    await get_request_wait_tracker().wait_for_embeddings(
+                                        msg.telemetry_id
+                                    )
+                                if processing_succeeded:
                                     await semantic_lock.close()
+                                    skill_lock_closed = True
 
                             # Cancellation only returns ownership after in-flight
                             # writes and cancelled embedding accounting have settled.
+                            # An error retains the lease until a retry can take it.
                             await run_to_completion(finish_skill_work)
                         else:
                             await semantic_lock.close()
@@ -600,7 +643,9 @@ class SemanticProcessor(DequeueHandlerBase):
                             get_request_wait_tracker().mark_semantic_failed(
                                 msg.telemetry_id, msg.id, failure
                             )
-                            self.report_error(failure, data)
+                        # File errors remain separate in request diagnostics, but
+                        # this dequeued package must settle the queue only once.
+                        self.report_error("\n".join(dag_stats.failures), data)
                         self._merge_request_stats(
                             msg.telemetry_id, error_count=len(dag_stats.failures)
                         )
@@ -631,7 +676,12 @@ class SemanticProcessor(DequeueHandlerBase):
                     exc_info=True,
                 )
                 if msg is not None:
-                    await self._requeue_semantic_msg_after_error(msg, data, e)
+                    await self._requeue_semantic_msg_after_error(
+                        msg,
+                        data,
+                        e,
+                        **({"skill_lock": semantic_lock} if msg.context_type == "skill" else {}),
+                    )
                 else:
                     self.report_error(str(e), data)
                 return None
@@ -668,12 +718,24 @@ class SemanticProcessor(DequeueHandlerBase):
                 )
                 self._circuit_breaker.record_failure(e)
                 if msg is not None:
-                    await self._requeue_semantic_msg_after_error(msg, data, e)
+                    await self._requeue_semantic_msg_after_error(
+                        msg,
+                        data,
+                        e,
+                        **({"skill_lock": semantic_lock} if msg.context_type == "skill" else {}),
+                    )
                 else:
                     self.report_error(str(e), data)
             return None
 
         finally:
+            if (
+                msg is not None
+                and msg.context_type == "skill"
+                and semantic_lock is not None
+                and not skill_lock_closed
+            ):
+                await run_to_completion(semantic_lock.close)
             if (
                 internal_skill_tracking
                 and msg is not None

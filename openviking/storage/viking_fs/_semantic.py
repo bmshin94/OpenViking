@@ -327,7 +327,11 @@ class _SemanticMixin:
         similarity ranking, so ``score`` stays 0 rather than a fabricated value
         callers might try to sort on.
         """
-        from openviking.retrieve.skill_results import SkillResultResolver, candidate_key
+        from openviking.retrieve.skill_results import (
+            SkillResultResolver,
+            candidate_key,
+            pagination_key,
+        )
         from openviking.storage.vikingdb_manager import VikingDBManagerProxy
         from openviking_cli.retrieve import ContextType, FindResult
 
@@ -349,7 +353,7 @@ class _SemanticMixin:
 
         resolver = SkillResultResolver(self, ctx)
         all_records = list(records)
-        seen_records = {candidate_key(record) for record in records}
+        seen_records = {pagination_key(record) for record in records}
 
         async def resolve_records(rows):
             matches = []
@@ -375,7 +379,7 @@ class _SemanticMixin:
                 limit=limit,
                 offset=len(all_records),
             )
-            keys = {candidate_key(record) for record in records}
+            keys = {pagination_key(record) for record in records}
             if keys and keys <= seen_records:
                 raise RuntimeError(
                     "Skill search pagination did not advance; results are incomplete"

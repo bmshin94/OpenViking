@@ -180,16 +180,6 @@ class SkillProcessor:
         telemetry = get_current_telemetry()
         lease = None
         try:
-            if apply_privacy:
-                skill_dict = await self.apply_skill_privacy(
-                    skill_dict,
-                    preparation.privacy_values,
-                    ctx,
-                    change_reason=privacy_change_reason,
-                    delete_if_empty=False,
-                )
-            skill_abstract = self._build_skill_abstract(skill_dict)
-
             effective_root_uri = self._resolve_skill_root_uri(ctx, target_uri)
             skill_dir_uri = f"{effective_root_uri}/{skill_dict['name']}"
 
@@ -208,6 +198,21 @@ class SkillProcessor:
                 )
 
             await run_to_completion(acquire_package_lock)
+
+            # Preparation above is read-only. A rejected package writer must
+            # not change its privacy config, and cancellation must let an
+            # in-flight config write finish before releasing the package lock.
+            if apply_privacy:
+                skill_dict = await run_to_completion(
+                    lambda: self.apply_skill_privacy(
+                        skill_dict,
+                        preparation.privacy_values,
+                        ctx,
+                        change_reason=privacy_change_reason,
+                        delete_if_empty=False,
+                    )
+                )
+            skill_abstract = self._build_skill_abstract(skill_dict)
 
             write_start = time.perf_counter()
             await run_to_completion(
@@ -496,6 +501,7 @@ class SkillProcessor:
         *,
         change_reason: str,
         delete_if_empty: bool,
+        owner_lease_ref: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not self._privacy_config_service:
             return skill_dict
@@ -508,11 +514,17 @@ class SkillProcessor:
                 values=privacy_values,
                 updated_by=ctx.user.user_id,
                 change_reason=change_reason,
+                **({"owner_lease_ref": owner_lease_ref} if owner_lease_ref is not None else {}),
             )
             return skill_dict
 
         if delete_if_empty:
-            await self._privacy_config_service.delete(ctx, "skill", skill_dict["name"])
+            await self._privacy_config_service.delete(
+                ctx,
+                "skill",
+                skill_dict["name"],
+                **({"owner_lease_ref": owner_lease_ref} if owner_lease_ref is not None else {}),
+            )
         return skill_dict
 
     async def sanitize_skill_privacy(

@@ -29,6 +29,10 @@ def skill_root_uri(uri: str) -> str:
     index = shape.content_index
     if not shape.is_skill or index is None or len(shape.parts) <= index + 1:
         return ""
+    if shape.parts[index + 1].startswith("."):
+        # Internal update backups retain their original vectors, but are not
+        # installed Skills. Hidden attachments inside a normal package remain valid.
+        return ""
     return "viking://" + "/".join(shape.parts[: index + 2])
 
 
@@ -38,6 +42,11 @@ def candidate_key(candidate: Dict[str, Any]) -> Any:
     if candidate.get("context_type") == ContextType.SKILL.value:
         return uri, candidate.get("level", 2)
     return uri
+
+
+def pagination_key(record: Dict[str, Any]) -> tuple:
+    """Identify a stored layer even when result merging keeps only its URI."""
+    return record.get("context_type", ""), record.get("uri", ""), record.get("level", 2)
 
 
 def merge_skill_results(matches: Sequence[MatchedContext]) -> List[MatchedContext]:

@@ -48,8 +48,10 @@ from openviking_cli.exceptions import (
     NotFoundError,
     ResourceExhaustedError,
 )
+from openviking_cli.utils import get_logger
 
 router = APIRouter(prefix="/api/v1/skills", tags=["skills"])
+logger = get_logger(__name__)
 
 _SKILL_INTEGRITY_MAX_ENTRIES = 512
 _SKILL_INTEGRITY_MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -517,6 +519,7 @@ async def _restore_skill_privacy(
     skill_name: str,
     previous_privacy: Optional[UserPrivacyConfigVersion],
     deleted_snapshot: Optional[Dict[str, bytes]] = None,
+    owner_lease_ref: Optional[Dict[str, Any]] = None,
 ) -> None:
     privacy = service.privacy_configs
     if privacy is None:
@@ -526,15 +529,19 @@ async def _restore_skill_privacy(
         # files as well as current values if the package update then fails.
         viking_fs = service.fs._ensure_initialized()  # noqa: SLF001
         root = privacy.get_config_root(ctx, "skill", skill_name)
-        async with privacy._config_lock(ctx, "skill", skill_name) as lease:  # noqa: SLF001
-            await viking_fs.rm(root, recursive=True, ctx=ctx, lease_ref=lease)
+        async with privacy._config_lock(  # noqa: SLF001
+            ctx, "skill", skill_name, owner_lease_ref=owner_lease_ref
+        ) as lease:
+            # Keep the config root: removing it would also remove the tree
+            # lock and allow a successful concurrent save to be overwritten.
+            await privacy._clear_contents(ctx, "skill", skill_name, lease)  # noqa: SLF001
             for path, content in deleted_snapshot.items():
                 await viking_fs.write_file_bytes(
                     f"{root}/{path}", content, ctx=ctx, lease_ref=lease
                 )
         return
     if previous_privacy is None:
-        await privacy.delete(ctx, "skill", skill_name)
+        await privacy.delete(ctx, "skill", skill_name, owner_lease_ref=owner_lease_ref)
         return
     await privacy.activate_version(
         ctx,
@@ -542,6 +549,7 @@ async def _restore_skill_privacy(
         skill_name,
         previous_privacy.version,
         updated_by=ctx.user.user_id,
+        owner_lease_ref=owner_lease_ref,
     )
 
 
@@ -793,11 +801,27 @@ async def update_skill(
         privacy = service.privacy_configs
         viking_fs = service.fs._ensure_initialized()  # noqa: SLF001
         update_lease = None
+        privacy_lease = None
         task_id = str(uuid.uuid4())
         deleted_privacy_snapshot = None
+        cleanup_warnings = []
+
+        def report_cleanup_failure(location: str, exc: Exception) -> None:
+            warning = f"Skill update cleanup failed at {location}: {exc}"
+            cleanup_warnings.append(warning)
+            logger.warning(warning, exc_info=True)
+
+        async def discard_backup() -> None:
+            # Called only after commit or successful restoration. Failure to
+            # discard this now-unused copy must not change that outcome.
+            if backup_created:
+                try:
+                    await viking_fs.rm(backup_uri, ctx=_ctx, recursive=True, lease_ref=update_lease)
+                except Exception as exc:
+                    report_cleanup_failure(backup_uri, exc)
 
         async def back_up_package() -> None:
-            nonlocal update_lease, backup_created, previous_privacy
+            nonlocal update_lease, privacy_lease, backup_created, previous_privacy
             update_lease = await viking_fs._async_agfs.pathlock_acquire_tree_batch(
                 [viking_fs._uri_to_path(uri, ctx=_ctx) for uri in (root_uri, backup_uri)]
             )
@@ -806,6 +830,15 @@ async def update_skill(
             if not await viking_fs.exists(f"{root_uri}/SKILL.md", ctx=_ctx):
                 raise NotFoundError(root_uri, "skill")
             if privacy is not None:
+                # Always acquire package then config. Keep config ownership
+                # through commit/rollback so a separate successful save cannot
+                # be silently replaced by restoration of this request's state.
+                privacy_lease = await viking_fs._async_agfs.pathlock_acquire_tree(
+                    viking_fs._uri_to_path(
+                        privacy.get_config_root(_ctx, "skill", skill_name), ctx=_ctx
+                    ),
+                    timeout_secs=30.0,
+                )
                 previous_privacy = await privacy.get_current(_ctx, "skill", skill_name)
             try:
                 await transfer_skill_package(
@@ -837,7 +870,12 @@ async def update_skill(
             if privacy_update_attempted:
                 try:
                     await _restore_skill_privacy(
-                        service, _ctx, skill_name, previous_privacy, deleted_privacy_snapshot
+                        service,
+                        _ctx,
+                        skill_name,
+                        previous_privacy,
+                        deleted_privacy_snapshot,
+                        owner_lease_ref=privacy_lease,
                     )
                 except Exception as exc:
                     failures.append(f"privacy: {exc}")
@@ -846,8 +884,38 @@ async def update_skill(
                     f"Skill update rollback failed; backup location: {backup_uri}; "
                     + "; ".join(failures)
                 )
-            if backup_created:
-                await viking_fs.rm(backup_uri, ctx=_ctx, recursive=True, lease_ref=update_lease)
+            await discard_backup()
+
+        async def release_update_locks() -> None:
+            try:
+                if privacy_lease is not None:
+                    try:
+                        # Deletion inside the update preserved the locked
+                        # directory. Remove an empty config only now, after
+                        # all possible config writes and rollback have ended.
+                        if (
+                            await privacy.get_meta(_ctx, "skill", skill_name) is None
+                            and await privacy.get_current(_ctx, "skill", skill_name) is None
+                            and not await privacy.list_versions(_ctx, "skill", skill_name)
+                        ):
+                            await viking_fs.rm(
+                                privacy.get_config_root(_ctx, "skill", skill_name),
+                                recursive=True,
+                                ctx=_ctx,
+                                lease_ref=privacy_lease,
+                            )
+                    except Exception as exc:
+                        # Config data has already been committed/restored.
+                        # Retain the result (or original error), but still
+                        # release both locks and report the leftover directory.
+                        report_cleanup_failure(
+                            privacy.get_config_root(_ctx, "skill", skill_name), exc
+                        )
+                    finally:
+                        await viking_fs._async_agfs.pathlock_release(privacy_lease)
+            finally:
+                if update_lease is not None:
+                    await viking_fs._async_agfs.pathlock_release(update_lease)
 
         try:
             async with resolve_skill_source(
@@ -904,6 +972,7 @@ async def update_skill(
                         _ctx,
                         change_reason="auto-extracted from update_skill",
                         delete_if_empty=True,
+                        owner_lease_ref=privacy_lease,
                     )
                 )
                 result = await service.resources.add_skill(
@@ -929,23 +998,22 @@ async def update_skill(
                 ) from update_error
             raise
         else:
-            if backup_created:
-                await run_to_completion(
-                    lambda: viking_fs.rm(
-                        backup_uri, ctx=_ctx, recursive=True, lease_ref=update_lease
-                    )
-                )
+            await run_to_completion(discard_backup)
             result["action"] = "update"
-            return result
         finally:
-            if update_lease is not None:
-                await run_to_completion(
-                    lambda: viking_fs._async_agfs.pathlock_release(update_lease)
-                )
-            if preparation and preparation.cleanup_path:
-                shutil.rmtree(preparation.cleanup_path, ignore_errors=True)
-            if resolved:
-                await resolved.cleanup()
+            try:
+                await run_to_completion(release_update_locks)
+            finally:
+                if preparation and preparation.cleanup_path:
+                    shutil.rmtree(preparation.cleanup_path, ignore_errors=True)
+                if resolved:
+                    try:
+                        await run_to_completion(resolved.cleanup)
+                    except Exception as exc:
+                        report_cleanup_failure(resolved.local_path, exc)
+        if cleanup_warnings:
+            result.setdefault("warnings", []).extend(cleanup_warnings)
+        return result
 
     execution = await run_operation(
         operation="skills.update",

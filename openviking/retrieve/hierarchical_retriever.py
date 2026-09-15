@@ -21,7 +21,12 @@ from openviking.models.embedder.base import EmbedResult, embed_compat
 from openviking.models.rerank import RerankClient
 from openviking.retrieve.memory_lifecycle import hotness_score
 from openviking.retrieve.retrieval_stats import get_stats_collector
-from openviking.retrieve.skill_results import SkillResultResolver, candidate_key, skill_root_uri
+from openviking.retrieve.skill_results import (
+    SkillResultResolver,
+    candidate_key,
+    pagination_key,
+    skill_root_uri,
+)
 from openviking.server.identity import RequestContext
 from openviking.storage.abstract_overview import body_for_preview
 from openviking.storage.expr import FilterExpr
@@ -197,7 +202,7 @@ class HierarchicalRetriever:
             has_skill = False
             seen_keys = set()
             while True:
-                page_keys = {candidate_key(result) for result in quick_results}
+                page_keys = {pagination_key(result) for result in quick_results}
                 if offset and page_keys and page_keys <= seen_keys:
                     raise RuntimeError(
                         "Skill search pagination did not advance; results are incomplete"
@@ -382,7 +387,7 @@ class HierarchicalRetriever:
             ):
                 page_size = max(limit, self.GLOBAL_SEARCH_TOPK)
                 pending = [
-                    (levels, len(page), {candidate_key(item) for item in page})
+                    (levels, len(page), {pagination_key(item) for item in page})
                     for levels, page in [([0, 1], global_results), ([2], leaf_results)]
                     if len(page) >= page_size
                 ]
@@ -404,7 +409,7 @@ class HierarchicalRetriever:
                     telemetry.count("vector.searches", 1)
                     telemetry.count("vector.scored", len(page))
                     telemetry.count("vector.scanned", len(page))
-                    keys = {candidate_key(item) for item in page}
+                    keys = {pagination_key(item) for item in page}
                     if keys and keys <= seen:
                         raise RuntimeError(
                             "Skill search pagination did not advance; results are incomplete"
@@ -679,7 +684,7 @@ class HierarchicalRetriever:
                 if skill_resolver and (
                     offset or any(item.get("context_type") == "skill" for item in results)
                 ):
-                    keys = {candidate_key(item) for item in results}
+                    keys = {pagination_key(item) for item in results}
                     seen = page_keys_by_uri.setdefault(current_uri, set())
                     if offset and keys <= seen:
                         raise RuntimeError(

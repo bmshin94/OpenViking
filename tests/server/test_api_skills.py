@@ -388,6 +388,7 @@ async def test_skills_api_update_restores_previous_privacy_after_privacy_write(c
         *,
         change_reason,
         delete_if_empty,
+        owner_lease_ref=None,
     ):
         result = await original_apply(
             self,
@@ -396,6 +397,7 @@ async def test_skills_api_update_restores_previous_privacy_after_privacy_write(c
             ctx,
             change_reason=change_reason,
             delete_if_empty=delete_if_empty,
+            owner_lease_ref=owner_lease_ref,
         )
         if skill_dict.get("name") == "rollback-privacy-after-write-skill":
             raise RuntimeError("privacy post-write failure")
