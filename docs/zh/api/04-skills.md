@@ -622,7 +622,7 @@ HTTP 对应查询为 `GET /api/v1/skills/search-web?include_content=true&include
 
 包内命中按完整 Skill 根 URI 合并，使用最高最终得分排序，再截取 `limit` 个 Skill。不同空间的同名 Skill 分别保留。`total` 是本次返回数组长度，不是所有匹配项的总数。
 
-每个 Skill 返回包内最终得分最高的一条命中。`uri`、`level`、`score`、`abstract` 直接使用该命中的原有字段，不增加额外返回字段。通用 `find/search` 的 `skills` 列表也使用同一合并规则。
+每个 Skill 返回包内最终得分最高的一条命中。`uri`、`level`、`score`、`abstract` 直接使用该命中的原有字段，不增加额外返回字段。按 Skill 合并和补页仅用于专用 `skills/find`；通用 `find/search` 保持按命中内容返回。
 
 | 返回字段 | 含义 |
 | --- | --- |
@@ -638,7 +638,7 @@ HTTP 对应查询为 `GET /api/v1/skills/search-web?include_content=true&include
 
 上表的 URI 规则适用于语义检索。通用 `find` 仅按 `filter` 筛选时，仍保留索引记录的 URI、返回 `score=0`，不为 L0、L1 补摘要文件后缀。
 
-搜索范围、层级和权限限制先作用于包内命中，再合并 Skill；根目录也必须可访问。上下文模式中一个 Skill 只占一次技能配额，使用实际命中并沿用原有内容预算。
+搜索范围、层级和权限限制先作用于包内命中，再合并 Skill；根目录也必须可访问。
 
 **Python SDK**：
 

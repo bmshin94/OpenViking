@@ -44,7 +44,7 @@ def fake_search(monkeypatch):
     abstract = AsyncMock(side_effect=root_abstract)
     read_visible = AsyncMock(side_effect=lambda uri, **kwargs: f"Visible content: {uri}")
     service = SimpleNamespace(
-        search=SimpleNamespace(find=find, search=find),
+        search=SimpleNamespace(find=find, search=find, find_skills=find),
         fs=SimpleNamespace(abstract=abstract, read_visible=read_visible),
     )
 

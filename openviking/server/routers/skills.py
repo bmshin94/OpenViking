@@ -604,7 +604,7 @@ async def find_skills(
         execution = await run_operation(
             operation="skills.find",
             telemetry=request.telemetry,
-            fn=lambda: service.search.find(
+            fn=lambda: service.search.find_skills(
                 query=request.query,
                 ctx=_ctx,
                 target_uri=resolved_uri,
@@ -635,7 +635,7 @@ async def find_skills(
                 run_operation(
                     operation="skills.find",
                     telemetry=request.telemetry,
-                    fn=lambda: service.search.find(
+                    fn=lambda: service.search.find_skills(
                         query=request.query,
                         ctx=_ctx,
                         target_uri=user_root,
@@ -647,7 +647,7 @@ async def find_skills(
                 run_operation(
                     operation="skills.find",
                     telemetry=request.telemetry,
-                    fn=lambda: service.search.find(
+                    fn=lambda: service.search.find_skills(
                         query=request.query,
                         ctx=_ctx,
                         target_uri=agent_root,

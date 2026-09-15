@@ -704,6 +704,7 @@ async def test_skill_package_indexes_nested_content_and_returns_actual_hit(clien
     with zipfile.ZipFile(archive, "w") as package:
         package.writestr("SKILL.md", _skill_md("package-search", "Root skill description"))
         package.writestr("reference/nested/recovery.md", "Restore a backup in another region.")
+        package.writestr("reference/nested/recovery-copy.md", "Restore a backup in another region.")
         package.writestr("reference/SKILL.md", _skill_md("attachment", "An ordinary attachment"))
     with archive.open("rb") as handle:
         uploaded = await client.post(
@@ -735,9 +736,12 @@ async def test_skill_package_indexes_nested_content_and_returns_actual_hit(clien
         )
         assert found.status_code == 200, found.text
         hits = found.json()["result"]["skills"]
-        assert len(hits) == 1
-        assert hits[0]["uri"] == f"{root}/reference/nested/recovery.md"
-        assert hits[0]["level"] == 2
+        assert len(hits) == (1 if endpoint == "/api/v1/skills/find" else 2)
+        expected_uris = {
+            f"{root}/reference/nested/recovery.md",
+            f"{root}/reference/nested/recovery-copy.md",
+        }
+        assert all(hit["uri"] in expected_uris and hit["level"] == 2 for hit in hits)
         assert "best_match" not in hits[0]
         if endpoint == "/api/v1/skills/find":
             assert hits[0]["root_uri"] == root

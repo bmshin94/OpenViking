@@ -231,7 +231,6 @@ class _SemanticMixin:
             HierarchicalRetriever,
             RetrieverMode,
         )
-        from openviking.retrieve.skill_results import SkillResultResolver
         from openviking_cli.retrieve import (
             ContextType,
             FindResult,
@@ -292,7 +291,6 @@ class _SemanticMixin:
             score_threshold=score_threshold,
             scope_dsl=filter,
             level=level,
-            skill_resolver=SkillResultResolver(self, real_ctx),
         )
 
         # Convert QueryResult to FindResult
@@ -332,11 +330,6 @@ class _SemanticMixin:
         similarity ranking, so ``score`` stays 0 rather than a fabricated value
         callers might try to sort on.
         """
-        from openviking.retrieve.skill_results import (
-            SkillResultResolver,
-            candidate_key,
-            pagination_key,
-        )
         from openviking.storage.vikingdb_manager import VikingDBManagerProxy
         from openviking_cli.retrieve import ContextType, FindResult
 
@@ -356,45 +349,17 @@ class _SemanticMixin:
             limit=limit,
         )
 
-        resolver = SkillResultResolver(self, ctx)
-        all_records = list(records)
-        seen_records = {pagination_key(record) for record in records}
-
-        async def resolve_records(rows):
-            matches = []
-            seen = set()
-            for record in rows:
-                matched = build_matched_context_from_record(record)
-                key = candidate_key(record)
-                if matched is not None and key not in seen:
-                    matches.append(matched)
-                    seen.add(key)
-            return await resolver.resolve(matches)
-
-        while (
-            limit > 0
-            and len(records) >= limit
-            and any(record.get("context_type") == "skill" for record in all_records)
-            and len(await resolve_records(all_records)) < limit
-        ):
-            records = await proxy.filter_in_tenant(
-                target_directories=list(target_directories or []),
-                extra_filter=filter,
-                level=level,
-                limit=limit,
-                offset=len(all_records),
-            )
-            keys = {pagination_key(record) for record in records}
-            if keys and keys <= seen_records:
-                raise RuntimeError(
-                    "Skill search pagination did not advance; results are incomplete"
-                )
-            seen_records.update(keys)
-            all_records.extend(records)
-
         memories, resources, skills = [], [], []
-        matches = await resolve_records(all_records)
-        for matched in matches[:limit]:
+        # Deduplicate by URI, mirroring what the vector path does: tags live on
+        # per-level records, so a directory carrying one matches on both its L0
+        # and L1 record and would otherwise be returned twice — inflating the
+        # total and eating two of the caller's limit slots for one result.
+        seen_uris: set = set()
+        for record in records:
+            matched = build_matched_context_from_record(record)
+            if matched is None or matched.uri in seen_uris:
+                continue
+            seen_uris.add(matched.uri)
             if matched.context_type == ContextType.MEMORY:
                 memories.append(matched)
             elif matched.context_type == ContextType.RESOURCE:
@@ -434,7 +399,6 @@ class _SemanticMixin:
         telemetry = get_current_telemetry()
         from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
         from openviking.retrieve.intent_analyzer import IntentAnalyzer
-        from openviking.retrieve.skill_results import SkillResultResolver, merge_skill_results
         from openviking_cli.retrieve import (
             ContextType,
             FindResult,
@@ -529,7 +493,6 @@ class _SemanticMixin:
                 score_threshold=score_threshold,
                 scope_dsl=filter,
                 level=level,
-                skill_resolver=SkillResultResolver(self, real_ctx),
             )
 
         query_results = await asyncio.gather(*[_execute(tq) for tq in typed_queries])
@@ -548,7 +511,7 @@ class _SemanticMixin:
         find_result = FindResult(
             memories=memories,
             resources=resources,
-            skills=merge_skill_results(skills)[:limit],
+            skills=skills,
             query_plan=query_plan,
             query_results=query_results,
         )

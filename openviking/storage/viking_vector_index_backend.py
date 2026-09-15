@@ -199,7 +199,6 @@ class _AsyncVectorAdapter:
 
         await asyncio.to_thread(_update)
 
-
 class _SingleAccountBackend:
     """绑定单个 account 的后端实现（内部类）"""
 
@@ -1610,9 +1609,6 @@ class VikingVectorIndexBackend:
             limit=limit,
             offset=offset,
             output_fields=RETRIEVAL_OUTPUT_FIELDS,
-            # Grouped Skill results may need more pages. A fresh random
-            # vector per page changes the order underneath the offset.
-            order_by="updated_at",
             ctx=ctx,
         )
 
@@ -1626,7 +1622,6 @@ class VikingVectorIndexBackend:
         target_directories: Optional[List[str]] = None,
         extra_filter: Optional[FilterExpr | Dict[str, Any]] = None,
         limit: int = 10,
-        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         # TODO：Better Alternative to Current Temporary Fix
 
@@ -1653,7 +1648,6 @@ class VikingVectorIndexBackend:
                 extra_filter=extra_filter,
             ),
         )
-        paging = {"offset": offset} if offset else {}
         return await self.search(
             query_vector=query_vector,
             sparse_query_vector=sparse_query_vector,
@@ -1661,7 +1655,6 @@ class VikingVectorIndexBackend:
             limit=limit,
             output_fields=RETRIEVAL_OUTPUT_FIELDS,
             ctx=ctx,
-            **paging,
         )
 
     async def get_context_by_uri(

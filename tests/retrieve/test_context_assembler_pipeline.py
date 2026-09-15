@@ -4,8 +4,6 @@
 import re
 from types import SimpleNamespace
 
-import pytest
-
 from openviking.retrieve.context_assembler import pipeline as pipeline_module
 from openviking.retrieve.context_assembler import rewrite as rewrite_module
 from openviking.retrieve.context_assembler.budget import (
@@ -599,63 +597,3 @@ async def test_no_relevant_digest_keeps_uris_out_of_the_dedup_ledger(monkeypatch
     assert result.rendered == ""
     assert len(result.entries) == 1
     assert recorded == []
-
-
-@pytest.mark.parametrize(
-    "suffix,level,detail,expected_detail,read_suffix",
-    [
-        ("/.abstract.md", 0, None, "overview", "/.overview.md"),
-        ("/reference/.overview.md", 1, None, "overview", "/reference/.overview.md"),
-        ("/reference/recovery.md", 2, None, "abstract", None),
-        ("/reference/recovery.md", 2, "full", "full", "/reference/recovery.md"),
-    ],
-)
-async def test_skill_package_hits_keep_existing_context_content_rules(
-    suffix, level, detail, expected_detail, read_suffix
-):
-    root = f"{USER_ROOT}/skills/backup"
-    hit_uri = f"{root}{suffix}"
-    summary = "Restore backups in another region."
-    body = "# Recovery\n\nRestore the backup.\n\n## Verify\n\nCheck the restored rows."
-    reads = []
-
-    async def fake_find(**kwargs):
-        return _FakeFindResult(
-            skills=[{"uri": hit_uri, "level": level, "score": 0.91, "abstract": summary}]
-        )
-
-    async def fake_read(uri, **kwargs):
-        reads.append(uri)
-        assert read_suffix is not None
-        assert uri == f"{root}{read_suffix}"
-        return body
-
-    service = SimpleNamespace(
-        search=SimpleNamespace(find=fake_find),
-        fs=SimpleNamespace(read=fake_read),
-        sessions=SimpleNamespace(),
-        viking_fs=None,
-    )
-    result = await assemble_context(
-        service=service,
-        ctx=_ctx(),
-        params=AssembleParams(
-            query="restore backup",
-            quotas={"skills": 1},
-            detail=detail,
-            max_tokens=1600,
-        ),
-    )
-
-    expected_uri = hit_uri.rsplit("/", 1)[0] if level < 2 else hit_uri
-    assert len(result.entries) == 1
-    entry = result.entries[0]
-    assert (entry.uri, entry.category, entry.score, entry.detail) == (
-        expected_uri,
-        "skills",
-        0.91,
-        expected_detail,
-    )
-    assert entry.text == (body if read_suffix else summary)
-    assert reads == ([f"{root}{read_suffix}"] if read_suffix else [])
-    assert result.stats["used_tokens"] <= 1600

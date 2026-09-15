@@ -621,7 +621,7 @@ Search and `get_skill` return content and manifests without executing scripts or
 
 Package hits are grouped by their full Skill root URI, ranked by their highest final score, then limited to `limit` Skills. Same-named Skills in different scopes remain distinct. `total` is the returned array length, not a count of all possible matches.
 
-Each Skill is represented by its highest-scoring package hit. The existing `uri`, `level`, `score`, and `abstract` fields come directly from that hit, without additional response fields. The `skills` list in general `find/search` uses the same grouping rules.
+Each Skill is represented by its highest-scoring package hit. The existing `uri`, `level`, `score`, and `abstract` fields come directly from that hit, without additional response fields. Package grouping and pagination apply only to dedicated `skills/find`; general `find/search` continues to return individual hits.
 
 | Response field | Meaning |
 | --- | --- |
@@ -637,7 +637,7 @@ General search with `read_content=true` continues to read the returned URI. The 
 
 The URI rules above apply to semantic search. Filter-only general `find` retains the stored record URI and returns `score=0`, without adding summary-file suffixes for L0 or L1.
 
-Scope, level, and permission filters apply before grouping; the Skill root must also be accessible. In context mode, each Skill consumes one Skill quota slot, using the actual hit and the existing content budget.
+Scope, level, and permission filters apply before grouping; the Skill root must also be accessible.
 
 **Python SDK**
 
