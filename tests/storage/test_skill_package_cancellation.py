@@ -12,6 +12,7 @@ import pytest
 
 from openviking.models.embedder.base import EmbedResult
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_queue_middleware import TaskWorkQueueMiddleware
 from openviking.service.task_work_index import (
     TaskWorkIndex,
     bind_task_context,
@@ -21,6 +22,7 @@ from openviking.service.task_work_index import (
 from openviking.storage.collection_schemas import TextEmbeddingHandler
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.named_queue import NamedQueue
+from openviking.storage.queuefs.process_result import ProcessOutcome
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
@@ -192,11 +194,14 @@ async def test_active_skill_embedding_cancel_settles_only_after_write_exit(
     with bind_task_context("skill-task", "acc", "alice"):
         payload, metadata = prepare_task_payload(msg.to_dict())
     queue = NamedQueue(
-        object(), "/queue", "Embedding", dequeue_handler=handler, task_work_index=index
+        object(),
+        "/queue",
+        "Embedding",
+        dequeue_handler=handler,
+        middlewares=[TaskWorkQueueMiddleware(index)],
     )
     envelope = {"data": json.dumps(payload)}
     assert index.register(queue.name, metadata)
-    queue._on_dequeue_start()
     worker = asyncio.create_task(queue.process_dequeued(envelope))
     try:
         await asyncio.wait_for(started.wait(), 1)
@@ -213,7 +218,8 @@ async def test_active_skill_embedding_cancel_settles_only_after_write_exit(
             assert model_cancelled.is_set()
     finally:
         release.set()
-        await asyncio.wait_for(worker, 1)
+        result = await asyncio.wait_for(worker, 1)
+        assert result.outcome is ProcessOutcome.CANCELLED
         await index.prepare_ack(queue.name, envelope)
         assert not index.has_work("skill-task")
         assert tracker.is_complete(telemetry_id)
