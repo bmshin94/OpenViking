@@ -1933,12 +1933,21 @@ class ReindexExecutor:
     ) -> dict[str, Any]:
         import yaml
 
-        parsed = yaml.safe_load(body_for_preview(abstract))
+        body = body_for_preview(abstract)
+        try:
+            parsed = yaml.safe_load(body)
+        except yaml.YAMLError:
+            parsed = None
         record = await self._fetch_existing_record(
             uri=uri, level=0, ctx=self._content_owner_ctx(uri, ctx)
         )
-        source_path = ((record or {}).get("meta") or {}).get("source_path", "")
-        if isinstance(parsed, dict):
+        previous_meta = (record or {}).get("meta") or {}
+        source_path = previous_meta.get("source_path", "")
+        if (
+            isinstance(parsed, dict)
+            and isinstance(parsed.get("name"), str)
+            and isinstance(parsed.get("description"), str)
+        ):
             return {
                 "source_path": source_path,
                 **{
@@ -1947,8 +1956,11 @@ class ReindexExecutor:
                 },
             }
         return {
-            "name": uri.rstrip("/").split("/")[-1],
-            "description": abstract,
+            **{
+                key: previous_meta[key] for key in ("tags", "allowed_tools") if key in previous_meta
+            },
+            "name": previous_meta.get("name") or uri.rstrip("/").split("/")[-1],
+            "description": body,
             "source_path": source_path,
         }
 

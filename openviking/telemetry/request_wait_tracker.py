@@ -8,7 +8,7 @@ import asyncio
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 
 @dataclass
@@ -207,7 +207,13 @@ class RequestWaitTracker:
                 raise TimeoutError(f"Request processing not complete after {timeout}s")
             await asyncio.sleep(poll_interval)
 
-    async def wait_for_embeddings(self, telemetry_id: str, poll_interval: float = 0.05) -> None:
+    async def wait_for_embeddings(
+        self,
+        telemetry_id: str,
+        poll_interval: float = 0.05,
+        *,
+        stop_waiting: Optional[Callable[[], bool]] = None,
+    ) -> None:
         """Drain embeddings while the producing semantic root remains pending."""
         if not telemetry_id:
             return
@@ -216,6 +222,11 @@ class RequestWaitTracker:
                 state = self._states.get(telemetry_id)
                 if state is None or not state.pending_embedding_roots:
                     return
+            if stop_waiting is not None and stop_waiting():
+                # Shutdown has drained the embedding consumer's active writes.
+                # Leave this semantic delivery unacked for recovery rather than
+                # waiting forever for embeddings still in the persistent queue.
+                raise asyncio.CancelledError("Embedding worker stopped with queued work")
             await asyncio.sleep(poll_interval)
 
     def build_queue_status(self, telemetry_id: str) -> Dict[str, Dict[str, object]]:

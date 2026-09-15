@@ -83,6 +83,7 @@ from openviking_cli.exceptions import (
     InternalError,
     InvalidArgumentError,
     NotInitializedError,
+    OpenVikingError,
 )
 from openviking_cli.utils import get_logger
 
@@ -2338,12 +2339,18 @@ class ResourceService:
         try:
             # Establish ownership before any queue work can start. Descendant
             # semantic and embedding messages inherit this same cancellable task.
-            task = await task_tracker.create(
-                "add_skill",
-                account_id=ctx.account_id,
-                user_id=ctx.user.user_id,
-                task_id=task_id,
-            )
+            async def create_skill_task() -> None:
+                nonlocal task
+                task = await task_tracker.create(
+                    "add_skill",
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                    task_id=task_id,
+                )
+
+            # Keep the returned record before propagating cancellation, so a
+            # committed task can still be settled by the exception handler.
+            await run_to_completion(create_skill_task)
             await task_tracker.start(
                 task.task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
             )
@@ -2415,6 +2422,15 @@ class ResourceService:
                     account_id=ctx.account_id,
                     user_id=ctx.user.user_id,
                 )
+                # Cancellation settles queue entries without counting errors.
+                # complete() preserves cancellation, so check it before the
+                # update caller commits the package and discards its backup.
+                if task_tracker.is_cancellation_requested(task.task_id):
+                    raise OpenVikingError(
+                        "Skill processing was cancelled",
+                        code="PROCESSING_ERROR",
+                        details={"task_id": task.task_id, "status": "cancelled"},
+                    )
             else:
                 result["task_id"] = task.task_id
 

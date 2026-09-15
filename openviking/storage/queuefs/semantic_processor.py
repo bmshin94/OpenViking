@@ -6,7 +6,7 @@ import asyncio
 import re
 import threading
 from contextlib import nullcontext
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, unquote, urlsplit
 
 from openviking.core.namespace import classify_uri
@@ -104,7 +104,12 @@ class SemanticProcessor(DequeueHandlerBase):
     _request_stats_order: List[str] = []
     _max_cached_stats = 256
 
-    def __init__(self, max_concurrent_llm: int = 32):
+    def __init__(
+        self,
+        max_concurrent_llm: int = 32,
+        *,
+        embedding_worker_stopped: Optional[Callable[[], bool]] = None,
+    ):
         """
         Initialize SemanticProcessor.
 
@@ -114,6 +119,7 @@ class SemanticProcessor(DequeueHandlerBase):
         self.max_concurrent_llm = max_concurrent_llm
         self._default_ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
         self._circuit_breaker = CircuitBreaker()
+        self._embedding_worker_stopped = embedding_worker_stopped
 
     @classmethod
     def _cache_dag_stats(cls, telemetry_id: str, uri: str, stats: DagStats) -> None:
@@ -618,7 +624,8 @@ class SemanticProcessor(DequeueHandlerBase):
                                 nonlocal skill_lock_closed
                                 if not msg.skip_vectorization:
                                     await get_request_wait_tracker().wait_for_embeddings(
-                                        msg.telemetry_id
+                                        msg.telemetry_id,
+                                        stop_waiting=self._embedding_worker_stopped,
                                     )
                                 if processing_succeeded:
                                     await semantic_lock.close()

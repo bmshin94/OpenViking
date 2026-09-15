@@ -199,6 +199,7 @@ class _AsyncVectorAdapter:
 
         await asyncio.to_thread(_update)
 
+
 class _SingleAccountBackend:
     """绑定单个 account 的后端实现（内部类）"""
 
@@ -1609,6 +1610,9 @@ class VikingVectorIndexBackend:
             limit=limit,
             offset=offset,
             output_fields=RETRIEVAL_OUTPUT_FIELDS,
+            # Grouped Skill results may need more pages. A fresh random
+            # vector per page changes the order underneath the offset.
+            order_by="updated_at",
             ctx=ctx,
         )
 

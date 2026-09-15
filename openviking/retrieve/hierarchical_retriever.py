@@ -590,7 +590,7 @@ class HierarchicalRetriever:
         collected_by_uri: Dict[Any, Dict[str, Any]] = {}
         dir_queue: List[tuple] = []  # Priority queue: (-score, uri)
         visited: set = set()
-        prev_topk_uris: set = set()
+        prev_topk_state: set = set()
         prev_pool_size = 0
         convergence_rounds = 0
         stagnant_rounds = 0
@@ -742,6 +742,10 @@ class HierarchicalRetriever:
                     skill_root_uri(c.uri) if c.context_type == ContextType.SKILL else c.uri
                     for c in grouped[:limit]
                 }
+                current_topk_state = {
+                    (c.uri, c.level, c.score) if c.context_type == ContextType.SKILL else c.uri
+                    for c in grouped[:limit]
+                }
             else:
                 current_topk = sorted(
                     collected_by_uri.values(),
@@ -749,14 +753,15 @@ class HierarchicalRetriever:
                     reverse=True,
                 )[:limit]
                 current_topk_uris = {c.get("uri", "") for c in current_topk}
+                current_topk_state = current_topk_uris
             current_pool_size = len(collected_by_uri)
 
-            if current_topk_uris == prev_topk_uris and len(current_topk_uris) >= limit:
+            if current_topk_state == prev_topk_state and len(current_topk_uris) >= limit:
                 convergence_rounds += 1
 
                 if convergence_rounds >= self.MAX_CONVERGENCE_ROUNDS:
                     break
-            elif current_pool_size == prev_pool_size:
+            elif current_pool_size == prev_pool_size and current_topk_state == prev_topk_state:
                 stagnant_rounds += 1
 
                 if stagnant_rounds >= self.MAX_CONVERGENCE_ROUNDS and not (
@@ -766,7 +771,7 @@ class HierarchicalRetriever:
             else:
                 convergence_rounds = 0
                 stagnant_rounds = 0
-                prev_topk_uris = current_topk_uris
+                prev_topk_state = current_topk_state
                 prev_pool_size = current_pool_size
 
         collected = sorted(

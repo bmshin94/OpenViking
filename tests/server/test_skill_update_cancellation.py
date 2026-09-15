@@ -7,6 +7,10 @@ import asyncio
 import threading
 import zipfile
 
+import pytest
+
+from openviking.service.task_tracker import get_task_tracker
+from openviking.service.task_work_index import get_task_context
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from tests.server.test_api_skills import _add_skill, _skill_md
@@ -56,8 +60,9 @@ async def _indexed_record(client, uri, level):
     ]
 
 
-async def test_update_timeout_cancels_unfinished_work_and_restores_package_and_index(
-    client, tmp_path, monkeypatch
+@pytest.mark.parametrize("cancel_mode", ["timeout", "task"])
+async def test_update_cancellation_restores_package_and_index(
+    client, tmp_path, monkeypatch, cancel_mode
 ):
     from openviking.storage.queuefs import semantic_dag
 
@@ -102,10 +107,13 @@ async def test_update_timeout_cancels_unfinished_work_and_restores_package_and_i
     started = set()
     cancelled = set()
     finished = set()
+    task_owners = {}
     original_summary = SemanticProcessor._generate_single_file_summary
     original_scheduler = semantic_dag.get_semantic_node_scheduler
 
     async def hold_summary(self, file_path, *args, **kwargs):
+        task_context = get_task_context()
+        task_owners[task_context.task_id] = task_context
         if file_path.endswith("/000-fast.md"):
             result = await original_summary(self, file_path, *args, **kwargs)
             fast_finished.set()
@@ -127,7 +135,11 @@ async def test_update_timeout_cancels_unfinished_work_and_restores_package_and_i
     updating = asyncio.create_task(
         client.put(
             f"/api/v1/skills/{name}",
-            json={"temp_file_id": new_upload, "wait": True, "timeout": 2},
+            json={
+                "temp_file_id": new_upload,
+                "wait": True,
+                "timeout": 2 if cancel_mode == "timeout" else 10,
+            },
         )
     )
     try:
@@ -135,9 +147,16 @@ async def test_update_timeout_cancels_unfinished_work_and_restores_package_and_i
         async with asyncio.timeout(1):
             while not await _indexed_record(client, f"{root}/references/000-fast.md", 2):
                 await asyncio.sleep(0.01)
+        if cancel_mode == "task":
+            assert len(task_owners) == 1
+            owner = next(iter(task_owners.values()))
+            await get_task_tracker().cancel(
+                owner.task_id, account_id=owner.account_id, user_id=owner.user_id
+            )
         response = await asyncio.wait_for(asyncio.shield(updating), timeout=5)
-        assert response.status_code == 504, response.text
-        assert response.json()["error"]["code"] == "DEADLINE_EXCEEDED"
+        expected_error = "DEADLINE_EXCEEDED" if cancel_mode == "timeout" else "PROCESSING_ERROR"
+        assert response.status_code >= 400, response.text
+        assert response.json()["error"]["code"] == expected_error
         assert cancelled == started
         assert not finished, "Rollback must not wait for blocked summaries to finish normally"
         assert len(started) < len(files), "Pending summaries should be skipped on cancellation"

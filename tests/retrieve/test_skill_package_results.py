@@ -608,3 +608,120 @@ async def test_search_merges_skills_across_queries_without_changing_other_bucket
     assert result.skills[0].uri == f"{SKILLS}/demo/second.md"
     assert result.skills[0].level == 2
     assert result.skills[0].abstract == "Content from second"
+
+
+@pytest.mark.asyncio
+async def test_thinking_continues_when_best_hit_improves_inside_same_skill():
+    class IndexedStore(PagedStore):
+        def _acl_enabled(self, ctx):
+            return True
+
+    root = f"{SKILLS}/demo"
+    records = []
+
+    def directory(uri, vector_score, rerank_score):
+        for level in (0, 1):
+            records.append(
+                row(uri, vector_score - level * 0.001, level, abstract=str(rerank_score))
+            )
+
+    directory(root, 1.0, 0.1)
+    parent = root
+    for i, score in enumerate([0.3, 0.5, 0.7, 0.9, 0.99]):
+        parent = f"{parent}/dir{i}"
+        directory(parent, 0.5 - i * 0.02, score)
+    target = f"{parent}/answer.md"
+    records.append(row(target, 0.3, 2, abstract="1.0"))
+    for i in range(12):
+        distractor = f"{SKILLS}/distractor{i:02}"
+        directory(distractor, 0.99 - i * 0.005, 0.01)
+        records.append(row(f"{distractor}/file.md", 0.99 - i * 0.005, 2, abstract=".01"))
+    children = {}
+    for record in records:
+        children.setdefault(record["uri"].rsplit("/", 1)[0], []).append(record)
+    store = IndexedStore(records, children)
+    retriever = HierarchicalRetriever(
+        store,
+        None,
+        retrieval_config=RetrievalConfig(hotness_alpha=0, score_propagation_alpha=0.5),
+    )
+    retriever._rerank_client = SimpleNamespace(
+        rerank_batch=lambda query, documents: [float(document) for document in documents]
+    )
+    result = await retriever.retrieve(
+        query(SKILLS), ctx(), limit=1, skill_resolver=SkillResultResolver(Files(), ctx())
+    )
+    assert result.matched_contexts[0].uri == target
+    assert result.matched_contexts[0].score == pytest.approx(0.925625)
+
+
+@pytest.mark.asyncio
+async def test_filter_pages_keep_one_order_through_the_collection_adapter(monkeypatch):
+    from openviking.storage.vectordb_adapters.local_adapter import LocalCollectionAdapter
+    from openviking.storage.viking_vector_index_backend import (
+        VikingVectorIndexBackend,
+        _SingleAccountBackend,
+    )
+    from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+
+    class Collection:
+        def __init__(self):
+            self.calls = []
+            self.records = [
+                dict(row(f"{SKILLS}/{name}", 0), id=name, updated_at=i, vector=vector)
+                for i, (name, vector) in enumerate(
+                    [
+                        ("a/1.md", [1.0, 0.0, 0.0, 0.0]),
+                        ("a/2.md", [0.99, 0.1, 0.0, 0.0]),
+                        ("b/1.md", [-1.0, 0.0, 0.0, 0.0]),
+                    ]
+                )
+            ]
+
+        def page(self, records, offset, limit):
+            page = records[offset : offset + limit]
+            self.calls.append([item["id"] for item in page])
+            return SimpleNamespace(
+                data=[SimpleNamespace(id=item["id"], score=0.0, fields=item) for item in page]
+            )
+
+        def search_by_vector(self, *, dense_vector, offset, limit, **kwargs):
+            records = sorted(
+                self.records,
+                key=lambda item: (
+                    -sum(a * b for a, b in zip(dense_vector, item["vector"], strict=True))
+                ),
+            )
+            return self.page(records, offset, limit)
+
+        def search_by_scalar(self, *, field, order, offset, limit, **kwargs):
+            records = sorted(self.records, key=lambda item: item[field], reverse=order == "desc")
+            return self.page(records, offset, limit)
+
+    collection = Collection()
+    adapter = LocalCollectionAdapter("context", "", "default")
+    adapter._collection = collection
+    account = _SingleAccountBackend(
+        VectorDBBackendConfig(backend="local", dimension=4),
+        ctx().account_id,
+        shared_adapter=adapter,
+    )
+    store = object.__new__(VikingVectorIndexBackend)
+    store.acl_manager = None
+    store._get_backend_for_context = lambda _: account
+    fs = SimpleNamespace(
+        _get_vector_store=lambda: store, _ensure_retrieval_scope=AsyncMock(), stat=Files().stat
+    )
+    monkeypatch.setattr(
+        "openviking.storage.vectordb_adapters.base.get_openviking_config",
+        lambda: SimpleNamespace(embedding=SimpleNamespace(dimension=4)),
+    )
+    values = iter([1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0])
+    monkeypatch.setattr(
+        "openviking.storage.vectordb_adapters.base.random.uniform", lambda *args: next(values)
+    )
+    result = await _SemanticMixin._find_by_filter(
+        fs, {"op": "must", "field": "search_tags", "conds": ["team=x"]}, ctx(), [SKILLS], 2, [2]
+    )
+    assert {skill_root_uri(hit.uri) for hit in result.skills} == {f"{SKILLS}/a", f"{SKILLS}/b"}
+    assert collection.calls == [["a/1.md", "a/2.md"], ["b/1.md"]]

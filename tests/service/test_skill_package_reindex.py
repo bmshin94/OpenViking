@@ -64,6 +64,40 @@ async def test_vectors_only_reindexes_entire_skill_with_common_media_inputs(monk
     assert counters.scanned_records == 7 and counters.rebuilt_records == 10
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "abstract",
+    [
+        "Manage backups.\nUse when: a backup needs recovery.",
+        "Use when: recovery is needed",
+        "A plain description",
+    ],
+)
+async def test_vectors_only_preserves_legacy_skill_descriptions(monkeypatch, abstract):
+    executor = ReindexExecutor()
+    executor._read_directory_abstract = AsyncMock(return_value=abstract)
+    executor._read_directory_overview = AsyncMock(return_value="Overview")
+    previous_meta = {
+        "name": "demo",
+        "tags": ["backup"],
+        "allowed_tools": ["Read"],
+        "source_path": "/demo",
+    }
+    executor._fetch_existing_record = AsyncMock(return_value={"meta": previous_meta})
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_viking_fs", lambda: SimpleNamespace()
+    )
+    vectorize = AsyncMock()
+    monkeypatch.setattr("openviking.service.reindex_executor.vectorize_directory_meta", vectorize)
+    counters = _ReindexCounters()
+    ctx = RequestContext(user=UserIdentifier("acc", "alice"), role=Role.USER)
+    await executor._reindex_skill_vectors(
+        uri="viking://agent/skills/demo", counters=counters, ctx=ctx, recursive=False
+    )
+    assert counters.failed_records == 0 and counters.rebuilt_records == 2
+    assert vectorize.await_args.kwargs["meta"] == {**previous_meta, "description": abstract}
+
+
 @pytest.mark.parametrize(
     "uri,expected",
     [
