@@ -190,25 +190,3 @@ async def test_skill_worker_keeps_package_locked_until_embeddings_finish(monkeyp
     assert not locked and tracker.is_complete(msg.telemetry_id)
     assert events == ["embedding-written", "released"]
     tracker.cleanup(msg.telemetry_id)
-
-
-@pytest.mark.asyncio
-async def test_skill_root_index_keeps_metadata(monkeypatch):
-    index = AsyncMock()
-    monkeypatch.setattr("openviking.utils.embedding_utils.vectorize_directory_meta", index)
-    ctx = RequestContext(user=UserIdentifier("acc", "alice"), role=Role.USER)
-    await SemanticProcessor()._vectorize_directory(
-        "viking://agent/skills/demo",
-        "skill",
-        "name: demo\ndescription: Description\ntags: [tag]\nallowed_tools: [Read]",
-        "Skill overview",
-        ctx=ctx,
-        skill_source_path="/tmp/demo",
-    )
-    assert index.await_args.kwargs["meta"] == {
-        "name": "demo",
-        "description": "Description",
-        "tags": ["tag"],
-        "allowed_tools": ["Read"],
-        "source_path": "/tmp/demo",
-    }

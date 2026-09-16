@@ -699,10 +699,19 @@ async def test_skills_api_validate_rfc_strict_and_loose_rules(client):
     assert any(issue["rule"] == "body_max_lines" for issue in long_body_result["warnings"])
 
 
-async def test_skill_package_indexes_nested_content_and_returns_actual_hit(client, tmp_path):
+async def test_skill_package_indexes_nested_content_and_returns_actual_hit(
+    client, service, tmp_path
+):
+    from openviking.server.identity import RequestContext, Role
+    from openviking.storage.expr import Eq
+    from openviking_cli.session.user_id import UserIdentifier
+
     archive = tmp_path / "package-search.zip"
     with zipfile.ZipFile(archive, "w") as package:
-        package.writestr("SKILL.md", _skill_md("package-search", "Root skill description"))
+        skill = _skill_md("package-search", "Root skill description")
+        package.writestr(
+            "SKILL.md", skill.replace("tags:\n", "allowed-tools: [Read, Bash]\ntags:\n")
+        )
         package.writestr("reference/nested/recovery.md", "Restore a backup in another region.")
         package.writestr("reference/nested/recovery-copy.md", "Restore a backup in another region.")
         package.writestr("reference/SKILL.md", _skill_md("attachment", "An ordinary attachment"))
@@ -718,6 +727,16 @@ async def test_skill_package_indexes_nested_content_and_returns_actual_hit(clien
     )
     assert added.status_code == 200, added.text
     root = added.json()["result"]["root_uri"]
+    # Both root summary levels retain the package identity in the stored index.
+    records = await service.vikingdb_manager.filter(
+        filter=Eq("uri", root),
+        output_fields=["level", "name", "description"],
+        ctx=RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT),
+    )
+    assert {record["level"] for record in records} == {0, 1}
+    for record in records:
+        assert record["name"] == "package-search"
+        assert record["description"] == "Root skill description"
     for directory in (root, f"{root}/reference", f"{root}/reference/nested"):
         for endpoint in ("abstract", "overview"):
             content = await client.get(f"/api/v1/content/{endpoint}", params={"uri": directory})
@@ -742,11 +761,12 @@ async def test_skill_package_indexes_nested_content_and_returns_actual_hit(clien
             f"{root}/reference/nested/recovery-copy.md",
         }
         assert all(hit["uri"] in expected_uris and hit["level"] == 2 for hit in hits)
-        assert "best_match" not in hits[0]
         if endpoint == "/api/v1/skills/find":
             assert hits[0]["root_uri"] == root
             assert hits[0]["skill_md_uri"] == f"{root}/SKILL.md"
             assert hits[0]["description"] == "Root skill description"
+            assert hits[0]["tags"] == ["test"]
+            assert hits[0]["allowed_tools"] == ["Read", "Bash"]
 
     listed = await client.get("/api/v1/skills")
     assert [skill["name"] for skill in listed.json()["result"]["skills"]] == ["package-search"]

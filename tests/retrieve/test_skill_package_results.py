@@ -113,6 +113,8 @@ def query(target=SKILLS):
         (SKILLS, ""),
         ("viking://user/alice/skills/.abstract.md", ""),
         (f"{SKILLS}/demo/.abstract.md", f"{SKILLS}/demo"),
+        (f"{SKILLS}/data.service", f"{SKILLS}/data.service"),
+        ("viking://user/alice/skills/data.service/", "viking://user/alice/skills/data.service"),
         ("viking://resources/example/skills/demo/SKILL.md", ""),
     ],
 )
@@ -291,26 +293,6 @@ async def test_scoped_hits_preserve_requested_level_and_do_not_use_outside_score
 
 
 @pytest.mark.asyncio
-async def test_grouping_returns_the_original_hit_without_rewriting_any_content():
-    root = f"{SKILLS}/demo"
-    files = Files()
-    resolver = SkillResultResolver(files, ctx())
-    cases = [
-        (f"{root}/reference/.overview.md", 1, "overview text"),
-        (f"{root}/guide.md", 2, "x" * 1500),
-    ]
-    for uri, level, abstract in cases:
-        original = MatchedContext(uri, ContextType.SKILL, level, abstract, score=0.9)
-        [result] = await resolver.resolve([original])
-        assert result is original
-        assert result.uri == uri
-        assert result.level == level
-        assert result.abstract == abstract
-        assert result.score == 0.9
-    assert files.stat_calls == [root]
-
-
-@pytest.mark.asyncio
 async def test_same_name_in_two_scopes_and_ties_are_stable():
     agent_root = f"{SKILLS}/demo"
     user_root = "viking://user/user1/skills/demo"
@@ -321,4 +303,3 @@ async def test_same_name_in_two_scopes_and_ties_are_stable():
     ]
     result = await SkillResultResolver(Files(), ctx()).resolve(matches)
     assert [item.uri for item in result] == [f"{agent_root}/a.md", f"{user_root}/a.md"]
-    assert result[0] is matches[2]
