@@ -70,6 +70,15 @@ class AddResourceProcessor(DequeueHandlerBase):
         staged = StagedSource.from_dict(msg.staged_source)
         await self._viking_fs.delete_temp(staged.temp_uri, ctx=ctx)
 
+    async def _cleanup_prepared_artifact(self, msg: AddResourceMsg, ctx: RequestContext) -> None:
+        if not msg.prepared or not isinstance(msg.prepared.get("artifact_ref"), dict):
+            return
+        from openviking.parse.output import ParseArtifactRef, store_for_artifact_ref
+
+        artifact_ref = ParseArtifactRef.from_dict(msg.prepared["artifact_ref"])
+        store = store_for_artifact_ref(artifact_ref, viking_fs=self._viking_fs, ctx=ctx)
+        await store.cleanup(artifact_ref)
+
     async def _release_cancelled_resources(
         self,
         msg: AddResourceMsg,
@@ -89,6 +98,8 @@ class AddResourceProcessor(DequeueHandlerBase):
                 logger.warning("[AddResource] Failed to release cancelled lock handoff: %s", exc)
         with suppress(Exception):
             await self._cleanup_staged_source(msg, ctx)
+        with suppress(Exception):
+            await self._cleanup_prepared_artifact(msg, ctx)
 
     async def _record_watch_execution(
         self,
@@ -157,6 +168,8 @@ class AddResourceProcessor(DequeueHandlerBase):
             else:
                 with suppress(Exception):
                     await self._cleanup_staged_source(msg, ctx)
+                with suppress(Exception):
+                    await self._cleanup_prepared_artifact(msg, ctx)
             status = (
                 "cancelled"
                 if task.status in (TaskStatus.CANCELLING, TaskStatus.CANCELLED)
@@ -189,6 +202,8 @@ class AddResourceProcessor(DequeueHandlerBase):
                 unregister_telemetry(telemetry_id)
                 with suppress(Exception):
                     await self._cleanup_staged_source(msg, ctx)
+                with suppress(Exception):
+                    await self._cleanup_prepared_artifact(msg, ctx)
                 return ProcessResult.failed(f"Invalid lock_handoff: {exc}")
 
         telemetry = resolve_telemetry(telemetry_id) if telemetry_id else None

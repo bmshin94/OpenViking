@@ -25,7 +25,7 @@ from openviking.storage.errors import (
     EmbeddingConfigurationError,
     EmbeddingRebuildRequiredError,
 )
-from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+from openviking.storage.queuefs.embedding_msg import EmbeddingMsg, EmbeddingOperation
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.vector_ids import vector_record_id
@@ -119,6 +119,11 @@ class CollectionSchemas:
                 {"FieldName": "search_tags", "FieldType": "list<string>"},
                 {"FieldName": "abstract", "FieldType": "string"},
                 {"FieldName": "content", "FieldType": "text"},
+                # md5 of the final stored file bytes for this record's URI. Used by
+                # incremental diff to skip re-processing unchanged files. Older
+                # records may lack it; callers must treat missing/empty as "unknown"
+                # and fall back to reading file bytes.
+                {"FieldName": "md5", "FieldType": "string", "DefaultValue": ""},
                 {"FieldName": "account_id", "FieldType": "string"},
                 {"FieldName": "owner_user_id", "FieldType": "string"},
                 {
@@ -482,7 +487,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         config = get_openviking_config()
         self._collection_name = config.storage.vectordb.name
         self._vector_dim = config.embedding.dimension
-        self._initialize_embedder(config)
         breaker_cfg = config.embedding.circuit_breaker
         self._circuit_breaker = CircuitBreaker(
             failure_threshold=breaker_cfg.failure_threshold,
@@ -600,6 +604,32 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             else inserted_data["abstract"][:VIKINGDB_CONTENT_MAX_SIZE]
         )
 
+    async def _apply_non_embedding_operation(
+        self,
+        embedding_msg: EmbeddingMsg,
+        ctx: RequestContext,
+    ) -> Dict[str, Any]:
+        if embedding_msg.operation is EmbeddingOperation.DELETE:
+            deleted_count = await self._vikingdb.strict_delete(
+                embedding_msg.record_ids,
+                ctx=ctx,
+            )
+            return {"deleted_count": deleted_count}
+
+        record_id = embedding_msg.record_ids[0]
+        # Backends expose update_data as a strict partial update. Send only the
+        # primary key and requested fields: re-reading and writing the complete
+        # record here can restore a stale vector/content value if a full upsert
+        # for the same record completes concurrently.
+        updated_record = {"id": record_id, **embedding_msg.update_fields}
+        result = await self._vikingdb.update(updated_record, ctx=ctx)
+        if not result.ok:
+            raise RuntimeError(
+                result.error_message
+                or f"failed to update vector record: {record_id}"
+            )
+        return updated_record
+
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         """Process dequeued message and add embedding vector(s)."""
         if not data:
@@ -612,11 +642,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             inserted_data = embedding_msg.context_data
             account_id = inserted_data.get("account_id", "default")
             context_user = inserted_data.get("user") or {}
-            user_id = (
-                context_user.get("user_id")
-                or inserted_data.get("owner_user_id")
-                or "default"
-            )
+            user_id = context_user.get("user_id") or inserted_data.get("owner_user_id") or "default"
             user = UserIdentifier(account_id=account_id, user_id=user_id)
             ctx = RequestContext(user=user, role=Role.USER, bypass_acl=True)
             collector = resolve_telemetry(embedding_msg.telemetry_id)
@@ -628,6 +654,12 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
                     self._record_request_success(embedding_msg)
                     return ProcessResult.success()
+
+                if embedding_msg.operation is not EmbeddingOperation.EMBED_AND_UPSERT:
+                    result = await self._apply_non_embedding_operation(embedding_msg, ctx)
+                    self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                    self._record_request_success(embedding_msg)
+                    return ProcessResult.success(result)
 
                 if not isinstance(embedding_msg.message, (str, list)):
                     logger.debug(
@@ -805,11 +837,16 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 try:
                     raw_upsert_options = inserted_data.pop("_upsert_options", {})
                     upsert_options = normalize_upsert_options(
-                        {**raw_upsert_options, "partial_update": True}
+                        {"partial_update": True, **raw_upsert_options}
                     )
-                    # Ensure vector DB has deterministic IDs per semantic layer.
+                    # Reuse the actual vector-store ID when a semantic plan
+                    # rebuilds an existing same-level record. Only genuinely new
+                    # records derive an ID locally from (account, uri, level).
+                    existing_record_id = inserted_data.pop("_upsert_record_id", None)
                     uri = inserted_data.get("uri")
-                    if uri:
+                    if existing_record_id:
+                        inserted_data["id"] = str(existing_record_id)
+                    elif uri:
                         inserted_data["id"] = vector_record_id(
                             account_id, uri, inserted_data.get("level", 2)
                         )

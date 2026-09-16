@@ -201,6 +201,89 @@ async def test_vectorize_file_uses_summary_first(monkeypatch, text_source, summa
 
 
 @pytest.mark.asyncio
+async def test_vectorize_file_threads_supplied_md5_without_reading_bytes(monkeypatch):
+    # The upload site already holds the final bytes; vectorize_file must accept
+    # the fingerprint via file_md5 and never read the file back to compute it.
+    queue = DummyQueue()
+    fs = DummyFS("deployment guide")
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source="summary_first", max_input_tokens=1000)
+        ),
+    )
+
+    await embedding_utils.vectorize_file(
+        file_path="viking://user/default/resources/demo.md",
+        summary_dict={"name": "demo.md", "summary": "deployment summary"},
+        parent_uri="viking://user/default/resources",
+        ctx=DummyReq(),
+        file_md5="a" * 32,
+    )
+
+    assert len(queue.items) == 1
+    assert queue.items[0].context_data["md5"] == "a" * 32
+    # No file read was issued just to fingerprint the content.
+    assert fs.read_file_bytes_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_vectorize_file_uses_supplied_content_without_reading_file(monkeypatch):
+    queue = DummyQueue()
+    fs = DummyFS("remote content")
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source="content_only", max_input_tokens=1000)
+        ),
+    )
+
+    await embedding_utils.vectorize_file(
+        file_path="viking://user/default/resources/a.py",
+        summary_dict={"name": "a.py", "summary": ""},
+        parent_uri="viking://user/default/resources",
+        ctx=DummyReq(),
+        file_content=b"print('local')",
+    )
+
+    assert queue.items[0].message == "print('local')"
+    assert fs.read_file_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_vectorize_file_omits_md5_when_not_supplied(monkeypatch):
+    queue = DummyQueue()
+    fs = DummyFS("deployment guide")
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source="summary_first", max_input_tokens=1000)
+        ),
+    )
+
+    await embedding_utils.vectorize_file(
+        file_path="viking://user/default/resources/demo.md",
+        summary_dict={"name": "demo.md", "summary": "deployment summary"},
+        parent_uri="viking://user/default/resources",
+        ctx=DummyReq(),
+    )
+
+    assert len(queue.items) == 1
+    # Unknown fingerprint must not be emitted, so a partial update never clears it.
+    assert "md5" not in queue.items[0].context_data
+    assert fs.read_file_bytes_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_vectorize_image_downsamples_large_embedding_input(monkeypatch):
     queue = DummyQueue()
     original = _jpeg_bytes(80, 220)
@@ -594,7 +677,9 @@ async def test_vectorize_directory_meta_l1_abstract_is_overview(monkeypatch):
     }
     await embedding_utils.vectorize_directory_meta(
         uri=uri,
-        abstract=render_abstract_overview(ContextLevel.ABSTRACT, uri, "Visible abstract.", metadata),
+        abstract=render_abstract_overview(
+            ContextLevel.ABSTRACT, uri, "Visible abstract.", metadata
+        ),
         overview=render_abstract_overview(ContextLevel.OVERVIEW, uri, overview, metadata),
         ctx=DummyReq(),
     )
@@ -1073,3 +1158,62 @@ async def test_vectorize_directory_meta_truncates_oversized_abstract(monkeypatch
         abstract = item.context_data["abstract"]
         assert len(abstract.encode("utf-8")) <= embedding_utils._ABSTRACT_MAX_BYTES
         assert abstract.encode("utf-8").decode("utf-8") == abstract
+
+
+@pytest.mark.asyncio
+async def test_full_upsert_append_merges_existing_search_tags_before_enqueue(monkeypatch):
+    queue = DummyQueue()
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS("body"))
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source="summary_only", max_input_tokens=1000)
+        ),
+    )
+
+    await embedding_utils.vectorize_file(
+        file_path="viking://resources/repo/a.py",
+        summary_dict={"name": "a.py", "summary": "summary"},
+        parent_uri="viking://resources/repo",
+        ctx=DummyReq(),
+        scalar_override={"search_tags": ["team=old", "lang=python"]},
+        ingest_options=IngestOptions.from_search_tags(["team=new", "owner=alice"], mode="append"),
+        partial_update=False,
+    )
+
+    msg = queue.items[0]
+    assert msg.context_data["search_tags"] == [
+        "team=new",
+        "lang=python",
+        "owner=alice",
+    ]
+    assert msg.context_data["_upsert_options"]["partial_update"] is False
+
+
+@pytest.mark.asyncio
+async def test_full_upsert_carries_existing_record_id_as_internal_override(monkeypatch):
+    queue = DummyQueue()
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS("body"))
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source="summary_only", max_input_tokens=1000)
+        ),
+    )
+
+    await embedding_utils.vectorize_file(
+        file_path="viking://resources/repo/a.py",
+        summary_dict={"name": "a.py", "summary": "summary"},
+        parent_uri="viking://resources/repo",
+        ctx=DummyReq(),
+        scalar_override={"_record_id": "id-from-vector-db"},
+        partial_update=False,
+    )
+
+    msg = queue.items[0]
+    assert msg.context_data["_upsert_record_id"] == "id-from-vector-db"
+    assert "_record_id" not in msg.context_data

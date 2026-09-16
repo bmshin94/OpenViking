@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-from .embedding_msg import EmbeddingMsg
+from .embedding_msg import EmbeddingMsg, EmbeddingOperation
 from .embedding_queue import EmbeddingQueue
 from .named_queue import NamedQueue, QueueError, QueueStatus
 from .process_result import ProcessOutcome, ProcessResult
@@ -24,6 +24,7 @@ __all__ = [
     "ProcessResult",
     "EmbeddingQueue",
     "EmbeddingMsg",
+    "EmbeddingOperation",
     "SemanticQueue",
     "SemanticDagExecutor",
     "SemanticMsg",

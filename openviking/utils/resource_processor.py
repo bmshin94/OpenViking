@@ -30,6 +30,7 @@ from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.expr import And, Eq, PathScope
 from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+from openviking.storage.resource_rnfv import RequestIntent
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry
@@ -48,6 +49,23 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 _MAX_FILE_VECTORIZATION_CONCURRENCY = 64
 VECTORDB_MAX_QUERY_LIMIT = 100_000
+
+
+class _DocRelStore:
+    """Adapt a parse output store so commit reads use target-relative paths.
+
+    Resource plans key files relative to the target root, while the underlying
+    artifact may store them below ``<doc_rel>/...``.
+    """
+
+    def __init__(self, store: Any, doc_rel: str) -> None:
+        self._store = store
+        base = (doc_rel or "").strip("/")
+        self._base = base
+
+    async def read_bytes(self, ref: Any, rel_path: str) -> bytes:
+        artifact_rel = f"{self._base}/{rel_path}" if rel_path else self._base
+        return await self._store.read_bytes(ref, artifact_rel)
 
 
 class ResourceProcessor:
@@ -104,6 +122,480 @@ class ResourceProcessor:
             )
         return self._media_processor
 
+    def _build_parse_output_store(self):
+        """Return the configured parse output store, or None for AGFS mode.
+
+        Local artifacts are consumed and committed to formal AGFS storage in
+        this synchronous request phase. They never cross an asynchronous queue
+        boundary, so parse and commit only need to run in the same process.
+        AGFS (the default) returns None to preserve its temp-tree path.
+        """
+        try:
+            parse_output = get_openviking_config().storage.parse_output
+        except Exception:
+            return None
+        if getattr(parse_output, "mode", "agfs") != "local":
+            return None
+        from openviking.parse.output import build_parse_output_store
+
+        return build_parse_output_store(
+            backend="local", local_root=parse_output.resolved_local_root()
+        )
+
+    @staticmethod
+    def _artifact_doc_rel(artifact_ref: Any, temp_doc_uri: Optional[str]) -> str:
+        """Return the document root's path relative to the artifact root.
+
+        ``temp_doc_uri`` is ``<artifact_root>/<doc_rel>`` (finalize built it), so
+        the relative document path is the suffix after the artifact root.
+        """
+        root = artifact_ref.root.rstrip("/")
+        doc = str(temp_doc_uri or "").rstrip("/")
+        if doc.startswith(f"{root}/"):
+            return doc[len(root) + 1 :]
+        return str(getattr(artifact_ref, "resource_rel", "") or "").strip("/")
+
+    @staticmethod
+    async def _cleanup_parse_result_artifact(
+        parse_result: Any, *, output_store: Any, viking_fs: Any, ctx: RequestContext
+    ) -> None:
+        artifact_ref = getattr(parse_result, "artifact_ref", None)
+        if artifact_ref is not None:
+            from openviking.parse.output import store_for_artifact_ref
+
+            store = (
+                output_store
+                if output_store is not None and output_store.backend == artifact_ref.backend
+                else store_for_artifact_ref(artifact_ref, viking_fs=viking_fs, ctx=ctx)
+            )
+            await store.cleanup(artifact_ref)
+        elif parse_result.temp_dir_path:
+            await viking_fs.delete_temp(parse_result.temp_dir_path, ctx=ctx)
+
+    @staticmethod
+    def _store_for_parse_artifact(
+        artifact_ref: Any, *, output_store: Any, viking_fs: Any, ctx: RequestContext
+    ) -> Any:
+        if output_store is not None and output_store.backend == artifact_ref.backend:
+            return output_store
+        from openviking.parse.output import store_for_artifact_ref
+
+        return store_for_artifact_ref(artifact_ref, viking_fs=viking_fs, ctx=ctx)
+
+    async def _persist_local_artifact(
+        self,
+        *,
+        output_store: Any,
+        artifact_ref: Any,
+        doc_rel: str,
+        root_uri: str,
+        root_is_file: bool = False,
+        ctx: RequestContext,
+        lease_ref: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Upload a local parse artifact into the final AGFS resource location."""
+        from openviking.storage.resource_diff_apply import apply_full_artifact_upload
+        from openviking.storage.resource_target import AgfsResourceTarget
+
+        target = AgfsResourceTarget(
+            viking_fs=get_viking_fs(),
+            vikingdb=self.vikingdb,
+            root_uri=root_uri,
+            ctx=ctx,
+            lease_ref=lease_ref,
+        )
+        return await apply_full_artifact_upload(
+            store=output_store,
+            artifact_ref=artifact_ref,
+            doc_rel=doc_rel,
+            target=target,
+            root_is_file=root_is_file,
+        )
+
+    async def _apply_local_incremental(
+        self,
+        *,
+        output_store: Any,
+        artifact_ref: Any,
+        doc_rel: str,
+        root_uri: str,
+        root_is_file: bool = False,
+        ctx: RequestContext,
+        lease_ref: Optional[Dict[str, Any]],
+        vectorize: bool = True,
+        ingest_options: IngestOptions | None = None,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+    ) -> Any:
+        """Apply a local artifact incrementally against an existing resource tree.
+
+        Only added/modified files are uploaded and removed files/vectors are
+        deleted, decided by the DiffPlan (artifact md5 manifest vs vector-store
+        md5). The completeness gate inside build_resource_diff_plan refuses
+        deletions from an incomplete target snapshot, so an unreadable target
+        never causes data loss.
+        """
+        from openviking.storage.resource_diff import build_resource_diff_snapshot
+        from openviking.storage.resource_diff_apply import apply_diff_plan
+        from openviking.storage.resource_target import AgfsResourceTarget
+        from openviking.storage.viking_fs._diff_plan import apply_request_scalar_intents
+
+        snapshot = await build_resource_diff_snapshot(
+            viking_fs=get_viking_fs(),
+            vikingdb=self.vikingdb,
+            store=output_store,
+            artifact_ref=artifact_ref,
+            target_uri=root_uri,
+            ctx=ctx,
+            doc_rel=doc_rel,
+            root_is_file=root_is_file,
+            require_vectors=vectorize,
+            request_intent=RequestIntent.from_ingest_options(
+                target_uri=root_uri,
+                processing_mode=processing_mode,
+                ingest_options=ingest_options,
+                vectorize=vectorize,
+            ),
+        )
+        target = AgfsResourceTarget(
+            viking_fs=get_viking_fs(),
+            vikingdb=self.vikingdb,
+            root_uri=root_uri,
+            ctx=ctx,
+            lease_ref=lease_ref,
+        )
+        # The store reads/writes artifact-relative paths, but the manifest walk
+        # keys diff results without the doc_rel prefix; apply reads bytes via the
+        # same store, so wrap it to re-add the prefix on read.
+        result = await apply_diff_plan(
+            snapshot.plan,
+            store=_DocRelStore(output_store, doc_rel),
+            artifact_ref=artifact_ref,
+            target=target,
+        )
+        resolved_plan = self._resolved_diff_plan(snapshot.plan, result)
+        apply_request_scalar_intents(snapshot.rnfv, resolved_plan)
+        result.scalar_updates = list(resolved_plan.scalar_updates)
+        return result
+
+    async def _commit_directory_artifact_with_plan(
+        self,
+        *,
+        output_store: Any,
+        artifact_ref: Any,
+        doc_rel: str,
+        root_uri: str,
+        target_preexisting: bool,
+        ctx: RequestContext,
+        lease_ref: Optional[Dict[str, Any]],
+        vectorize: bool,
+        summarize: bool,
+        processing_mode: ProcessingMode,
+        is_code_repo: bool,
+        ingest_options: IngestOptions,
+        source_metadata: Optional[Dict[str, str]],
+    ) -> tuple[Any, Any]:
+        """Resolve and commit one directory through the canonical update plan."""
+        from openviking.storage.context_update_plan import (
+            build_context_update_plan_from_snapshot,
+            execute_content_tree_actions,
+        )
+        from openviking.storage.resource_diff import (
+            build_rnfv_snapshot,
+        )
+        from openviking.storage.resource_diff_apply import ApplyResult
+        from openviking.storage.resource_target import AgfsResourceTarget
+
+        target = AgfsResourceTarget(
+            viking_fs=get_viking_fs(),
+            vikingdb=self.vikingdb,
+            root_uri=root_uri,
+            ctx=ctx,
+            lease_ref=lease_ref,
+        )
+        from openviking.parse.image_rewrite import rewrite_artifact_image_uris
+
+        await rewrite_artifact_image_uris(
+            output_store,
+            artifact_ref,
+            doc_rel=doc_rel,
+            target_root_uri=root_uri,
+        )
+        plan_processing_mode = (
+            processing_mode
+            if processing_mode == VECTORS_ONLY or summarize or vectorize
+            else VECTORS_ONLY
+        )
+        request = RequestIntent.from_ingest_options(
+            target_uri=root_uri,
+            processing_mode=plan_processing_mode,
+            ingest_options=ingest_options,
+            vectorize=vectorize,
+        )
+        rnfv = await build_rnfv_snapshot(
+            viking_fs=get_viking_fs(),
+            vikingdb=self.vikingdb,
+            store=output_store,
+            artifact_ref=artifact_ref,
+            target_uri=root_uri,
+            ctx=ctx,
+            doc_rel=doc_rel,
+            request_intent=request,
+            target_preexisting=target_preexisting,
+        )
+        artifact_paths = {
+            path: path for path, entry in rnfv.new.entries.items() if not entry.is_dir
+        }
+        diff, context_plan = await build_context_update_plan_from_snapshot(
+            snapshot=rnfv,
+            store=_DocRelStore(output_store, doc_rel),
+            artifact_ref=artifact_ref,
+            target=target,
+            vikingdb=self.vikingdb,
+            context_type=context_type_for_uri(root_uri),
+            is_code_repo=is_code_repo,
+            account_id=ctx.account_id,
+            ctx=ctx,
+            root_preexisting=target_preexisting,
+            artifact_paths=artifact_paths,
+            ingest_options=ingest_options,
+            source_metadata=source_metadata,
+        )
+        await execute_content_tree_actions(
+            context_plan.content_tree_actions,
+            store=_DocRelStore(output_store, doc_rel),
+            artifact_ref=artifact_ref,
+            target=target,
+        )
+
+        entries = diff.entries
+        new_entries = rnfv.new.entries
+        apply_result = ApplyResult(
+            uploaded=sorted(
+                action.relative_path
+                for action in context_plan.content_tree_actions
+                if action.new_kind == "file"
+            ),
+            added=sorted(
+                path
+                for path, entry in entries.items()
+                if entry.content_state.value in {"added", "restore"} and entry.new_kind == "file"
+            ),
+            added_dirs=sorted(
+                path
+                for path, entry in entries.items()
+                if entry.content_state.value in {"added", "restore"}
+                and entry.new_kind == "directory"
+            ),
+            modified=sorted(
+                path for path, entry in entries.items() if entry.content_state.value == "modified"
+            ),
+            unchanged=sorted(
+                path
+                for path, entry in entries.items()
+                if entry.content_state.value == "unchanged" and entry.new_kind == "file"
+            ),
+            deleted=sorted(
+                path
+                for path, entry in entries.items()
+                if entry.content_state.value == "deleted" and entry.old_kind == "file"
+            ),
+            deleted_dirs=sorted(
+                path
+                for path, entry in entries.items()
+                if entry.content_state.value == "deleted" and entry.old_kind == "directory"
+            ),
+            structural=sorted(
+                path
+                for path, entry in entries.items()
+                if entry.content_state.value == "replace_kind"
+            ),
+            repair=sorted(
+                path
+                for path, entry in entries.items()
+                if entry.index_state.value in {"missing", "partial"}
+                and entry.content_state.value == "unchanged"
+            ),
+            files=sorted(path for path, entry in new_entries.items() if not entry.is_dir),
+            md5_by_rel={
+                path: str(entry.md5)
+                for path, entry in entries.items()
+                if entry.new_kind == "file" and entry.md5
+            },
+        )
+        return apply_result, context_plan
+
+    @staticmethod
+    def _resolved_diff_plan(diff_plan: Any, apply_result: Any) -> Any:
+        """Copy a plan with body comparisons replaced by their applied result."""
+        from dataclasses import replace
+
+        return replace(
+            diff_plan,
+            added=list(apply_result.added),
+            added_dirs=list(apply_result.added_dirs),
+            modified=list(apply_result.modified),
+            deleted=list(apply_result.deleted),
+            deleted_dirs=list(apply_result.deleted_dirs),
+            unchanged=list(apply_result.unchanged),
+            repair=list(apply_result.repair),
+            orphan_vectors=list(apply_result.orphan_vectors),
+            structural=list(apply_result.structural),
+            needs_body_compare=[],
+            new_md5s=dict(apply_result.md5_by_rel),
+        )
+
+    @staticmethod
+    def _apply_result_to_changes(apply_result: Any, root_uri: str) -> Dict[str, List[str]]:
+        """Convert an ApplyResult into target-URI-keyed semantic changes.
+
+        The DAG matches its changed-path set against target URIs, so relative
+        paths are joined onto ``root_uri``. Only files that actually changed
+        (uploaded) or were removed are reported; unchanged files are omitted so
+        the DAG reuses their summaries.
+        """
+        base = root_uri.rstrip("/")
+
+        def _uris(rels: List[str]) -> List[str]:
+            return sorted(base if not rel else f"{base}/{rel}" for rel in rels)
+
+        changes: Dict[str, List[str]] = {}
+        if apply_result.added:
+            changes["added"] = _uris(apply_result.added)
+        if apply_result.modified:
+            changes["modified"] = _uris(apply_result.modified)
+        if apply_result.repair:
+            changes.setdefault("modified", []).extend(_uris(apply_result.repair))
+            changes["modified"] = sorted(set(changes["modified"]))
+        if apply_result.deleted:
+            changes["deleted"] = _uris(apply_result.deleted)
+        return changes
+
+    @staticmethod
+    def _apply_result_to_file_md5s(apply_result: Any, root_uri: str) -> Dict[str, str]:
+        """Map uploaded files' md5 to target URIs for the DAG's re-vectorization."""
+        base = root_uri.rstrip("/")
+        return {
+            (base if not rel else f"{base}/{rel}"): md5
+            for rel, md5 in apply_result.md5_by_rel.items()
+            if md5
+        }
+
+    @staticmethod
+    def _apply_result_to_file_abstracts(apply_result: Any, root_uri: str) -> Dict[str, str]:
+        base = root_uri.rstrip("/")
+        return {
+            (base if not rel else f"{base}/{rel}"): abstract
+            for rel, abstract in apply_result.abstracts_by_rel.items()
+            if abstract
+        }
+
+    @staticmethod
+    def _apply_result_is_noop(apply_result: Any) -> bool:
+        """Return whether diff application performed no target or index work."""
+        return not any(
+            getattr(apply_result, field, ())
+            for field in (
+                "uploaded",
+                "added",
+                "added_dirs",
+                "modified",
+                "deleted",
+                "deleted_dirs",
+                "orphan_vectors",
+                "structural",
+                "repair",
+            )
+        )
+
+    @staticmethod
+    def _log_commit_summary(apply_result: Any, *, root_uri: str, is_initial: bool) -> None:
+        """Emit one structured line summarizing what the commit landed.
+
+        Initial import has no target to diff against, so it reports the total
+        file/dir count; an incremental commit reports the per-state file counts
+        from the DiffPlan so operators can see how much the diff actually touched.
+        """
+        if is_initial:
+            logger.info(
+                "[add_resource] initial import committed root=%s files=%d dirs=%d",
+                root_uri,
+                len(apply_result.files),
+                len(apply_result.added_dirs),
+            )
+            return
+        logger.info(
+            "[add_resource] incremental diff committed root=%s "
+            "added=%d modified=%d deleted=%d unchanged=%d repair=%d "
+            "structural=%d orphan_vectors=%d added_dirs=%d deleted_dirs=%d",
+            root_uri,
+            len(apply_result.added),
+            len(apply_result.modified),
+            len(apply_result.deleted),
+            len(apply_result.unchanged),
+            len(apply_result.repair),
+            len(apply_result.structural),
+            len(apply_result.orphan_vectors),
+            len(apply_result.added_dirs),
+            len(apply_result.deleted_dirs),
+        )
+
+    @staticmethod
+    def _log_context_update_plan(plan: Any) -> None:
+        from collections import Counter
+
+        content = Counter(action.operation.value for action in plan.content_tree_actions)
+        direct = Counter(action.operation.value for action in plan.direct_index_actions)
+        entries = plan.semantic_plan.tree.entries if plan.semantic_plan is not None else ()
+        semantic = Counter(entry.semantic_action.value for entry in entries)
+        slots = Counter(
+            (slot.operation.value, slot.trigger.value if slot.trigger is not None else "none")
+            for entry in entries
+            for slot in entry.index_slots
+        )
+        logger.info(
+            "[ContextUpdatePlan] root=%s content=%s semantic=%s direct_index=%s index_slots=%s",
+            plan.root_uri,
+            dict(content),
+            dict(semantic),
+            dict(direct),
+            {f"{operation}:{trigger}": count for (operation, trigger), count in slots.items()},
+        )
+
+    async def _vectorize_prepared_files(
+        self,
+        prepared: Dict[str, Any],
+        root_uri: str,
+        *,
+        local_artifact: Any,
+        ingest_options: IngestOptions | None,
+        ctx: RequestContext,
+    ) -> None:
+        """Vectorize a committed directory's files (full tree or local changed subset).
+
+        Shared by the ``vectors_only`` semantic-plan branch and the plain
+        vectors-only path so both resolve the local artifact store + changed-file
+        subset identically instead of duplicating the derivation.
+        """
+        local_store = self._build_parse_output_store() if local_artifact is not None else None
+        artifact_files = prepared.get("artifact_files")
+        if prepared.get("changes") is not None:
+            base = root_uri.rstrip("/") + "/"
+            changed_uris = {
+                uri for kind in ("added", "modified") for uri in prepared["changes"].get(kind, [])
+            }
+            artifact_files = sorted(
+                uri[len(base) :] for uri in changed_uris if uri.startswith(base)
+            )
+        await self._vectorize_resource_files(
+            root_uri,
+            ctx=ctx,
+            ingest_options=ingest_options,
+            artifact_store=local_store,
+            artifact_ref=local_artifact,
+            artifact_files=artifact_files,
+            file_md5s=prepared.get("file_md5s"),
+        )
+
     @staticmethod
     def _empty_directory_error(meta: Dict[str, Any]) -> str:
         """Build a bounded error message for a directory with no successful files."""
@@ -122,6 +614,33 @@ class ResourceProcessor:
         else:
             message = "Directory import produced no content: no processable files were selected"
 
+        details = ResourceProcessor._failed_file_details(failures)
+        if details:
+            message += "; failed files: " + "; ".join(details)
+            if len(failures) > len(details):
+                message += f"; ... {len(failures) - len(details)} more"
+        return message
+
+    @staticmethod
+    def _directory_parse_failures(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return files selected for parsing whose parser did not produce content."""
+        failed_files = meta.get("failed_files")
+        if not isinstance(failed_files, list):
+            return []
+        return [item for item in failed_files if isinstance(item, dict) and "error" in item]
+
+    @staticmethod
+    def _incomplete_directory_error(failures: List[Dict[str, Any]]) -> str:
+        message = f"Directory import incomplete: {len(failures)} file(s) failed to parse"
+        details = ResourceProcessor._failed_file_details(failures)
+        if details:
+            message += "; failed files: " + "; ".join(details)
+            if len(failures) > len(details):
+                message += f"; ... {len(failures) - len(details)} more"
+        return message
+
+    @staticmethod
+    def _failed_file_details(failures: List[Dict[str, Any]]) -> List[str]:
         details: List[str] = []
         for item in failures[:5]:
             if not isinstance(item, dict):
@@ -134,11 +653,7 @@ class ResourceProcessor:
             if remote_ids:
                 path = f"{path} ({', '.join(remote_ids)})"
             details.append(f"{path}: {reason[:120]}")
-        if details:
-            message += "; failed files: " + "; ".join(details)
-            if len(failures) > len(details):
-                message += f"; ... {len(failures) - len(details)} more"
-        return message
+        return details
 
     async def prepare_durable_source(
         self,
@@ -259,6 +774,13 @@ class ResourceProcessor:
                 # Use reason as instruction fallback so it influences L0/L1
                 # generation and improves search relevance as documented.
                 effective_instruction = instruction or reason
+                # Local artifact mode writes parse output to this worker's disk
+                # instead of AGFS temp. The same synchronous request commits all
+                # required bytes to formal AGFS before any async queue handoff.
+                # The store is task-scoped; default AGFS mode leaves kwargs untouched.
+                output_store = self._build_parse_output_store()
+                if output_store is not None:
+                    kwargs.setdefault("parse_output_store", output_store)
                 if path.startswith(("http://", "https://", "git@", "ssh://", "git://")):
                     await _set_stage("fetching")
                 else:
@@ -298,10 +820,32 @@ class ResourceProcessor:
                     result["status"] = "error"
                     result["errors"].append(self._empty_directory_error(parse_meta))
                     try:
-                        await viking_fs.delete_temp(parse_result.temp_dir_path, ctx=ctx)
+                        await self._cleanup_parse_result_artifact(
+                            parse_result, output_store=output_store, viking_fs=viking_fs, ctx=ctx
+                        )
                     except Exception as exc:
                         logger.warning(
                             "[ResourceProcessor] Failed to clean empty directory temp %s: %s",
+                            parse_result.temp_dir_path,
+                            exc,
+                        )
+                    stage_status = "error"
+                    return result
+
+                parse_failures = self._directory_parse_failures(parse_meta)
+                use_directory_update_plan = is_directory_aggregate and (
+                    summarize or bool(kwargs.get("build_index", True))
+                )
+                if use_directory_update_plan and parse_failures:
+                    result["status"] = "error"
+                    result["errors"].append(self._incomplete_directory_error(parse_failures))
+                    try:
+                        await self._cleanup_parse_result_artifact(
+                            parse_result, output_store=output_store, viking_fs=viking_fs, ctx=ctx
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[ResourceProcessor] Failed to clean incomplete directory temp %s: %s",
                             parse_result.temp_dir_path,
                             exc,
                         )
@@ -356,6 +900,17 @@ class ResourceProcessor:
                 stage_start = time.perf_counter()
                 stage_status = "ok"
                 finalize_start = time.perf_counter()
+                artifact_ref = getattr(parse_result, "artifact_ref", None)
+                artifact_output_store = (
+                    self._store_for_parse_artifact(
+                        artifact_ref,
+                        output_store=output_store,
+                        viking_fs=viking_fs,
+                        ctx=ctx,
+                    )
+                    if artifact_ref is not None
+                    else None
+                )
                 with get_viking_fs().bind_request_context(ctx):
                     context_tree = await self.tree_builder.finalize_from_temp(
                         temp_dir_path=parse_result.temp_dir_path,
@@ -372,6 +927,8 @@ class ResourceProcessor:
                             and parse_result.source_format not in {"directory", "repository"}
                             and not to_is_directory
                         ),
+                        artifact_ref=artifact_ref,
+                        output_store=artifact_output_store,
                     )
                     if context_tree and context_tree.root:
                         result["root_uri"] = context_tree.root.uri
@@ -387,10 +944,14 @@ class ResourceProcessor:
                 telemetry.set_error("resource_processor.finalize", "PROCESSING_ERROR", str(e))
                 stage_status = "error"
 
-                # Cleanup temporary directory on error (via VikingFS)
+                # Cleanup the parser-owned artifact through its own backend.
                 try:
-                    if parse_result.temp_dir_path:
-                        await get_viking_fs().delete_temp(parse_result.temp_dir_path, ctx=ctx)
+                    await self._cleanup_parse_result_artifact(
+                        parse_result,
+                        output_store=output_store,
+                        viking_fs=get_viking_fs(),
+                        ctx=ctx,
+                    )
                 except Exception:
                     pass
 
@@ -414,6 +975,16 @@ class ResourceProcessor:
             resource_lock: Optional[Dict[str, Any]] = preacquired_lock
             target_preexisting = False
             source_committed = False
+            local_incremental_changes: Optional[Dict[str, List[str]]] = None
+            local_incremental_file_md5s: Dict[str, str] = {}
+            local_file_abstracts: Dict[str, str] = {}
+            local_artifact_files: List[str] = []
+            local_artifact_doc_rel = ""
+            incremental_noop = False
+            context_update_plan = None
+            use_context_update_plan = False
+            apply_result = None
+            rnfv_artifact_committed = False
 
             if root_uri and temp_uri:
                 stage_start = time.perf_counter()
@@ -464,23 +1035,153 @@ class ResourceProcessor:
                                 uri=root_uri,
                                 root_is_file=root_is_file,
                             )
-                    if not target_preexisting:
-                        await viking_fs.persist_temp_tree(
-                            temp_uri,
-                            root_uri,
+                    use_context_update_plan = not root_is_file and (
+                        artifact_ref is not None
+                        or callable(getattr(parse_result, "ensure_artifact_ref", None))
+                    )
+                    if use_context_update_plan:
+                        ensure_artifact_ref = getattr(parse_result, "ensure_artifact_ref", None)
+                        artifact_ref = (
+                            ensure_artifact_ref() if callable(ensure_artifact_ref) else artifact_ref
+                        )
+                        if artifact_ref is None:
+                            raise RuntimeError("semantic plan requires a parse artifact")
+                        artifact_store = self._store_for_parse_artifact(
+                            artifact_ref,
+                            output_store=output_store,
+                            viking_fs=viking_fs,
+                            ctx=ctx,
+                        )
+                        local_artifact_doc_rel = self._artifact_doc_rel(artifact_ref, temp_uri)
+                        semantic_source = self._semantic_source_metadata(
+                            path=path,
+                            prepared_resource=prepared_resource,
+                            source_format=parse_result.source_format,
+                        )
+                        (
+                            apply_result,
+                            context_update_plan,
+                        ) = await self._commit_directory_artifact_with_plan(
+                            output_store=artifact_store,
+                            artifact_ref=artifact_ref,
+                            doc_rel=local_artifact_doc_rel,
+                            root_uri=root_uri,
+                            target_preexisting=target_preexisting,
                             ctx=ctx,
                             lease_ref=resource_lock,
+                            vectorize=bool(kwargs.get("build_index", True)),
+                            summarize=summarize,
+                            processing_mode=normalize_processing_mode(
+                                kwargs.get("processing_mode")
+                            ),
+                            ingest_options=ingest_options,
+                            is_code_repo=parse_result.source_format == "repository",
+                            source_metadata=semantic_source,
                         )
+                        local_artifact_files = list(apply_result.files)
+                        local_incremental_file_md5s = self._apply_result_to_file_md5s(
+                            apply_result, root_uri
+                        )
+                        self._log_commit_summary(
+                            apply_result,
+                            root_uri=root_uri,
+                            is_initial=not target_preexisting,
+                        )
+                        self._log_context_update_plan(context_update_plan)
+                        incremental_noop = target_preexisting and context_update_plan.is_noop()
+                        temp_uri = root_uri
+                        source_committed = True
+                    elif not target_preexisting:
+                        if artifact_ref is not None and artifact_ref.backend == "local":
+                            # Local artifacts are not in AGFS temp, so persist by
+                            # uploading every file under the document root to the
+                            # final resource location (initial import = all added).
+                            # rewrite_image_uris still runs afterwards against the
+                            # now-uploaded AGFS files, identical to the temp path.
+                            local_artifact_doc_rel = self._artifact_doc_rel(artifact_ref, temp_uri)
+                            apply_result = await self._persist_local_artifact(
+                                output_store=output_store,
+                                artifact_ref=artifact_ref,
+                                doc_rel=local_artifact_doc_rel,
+                                root_uri=root_uri,
+                                root_is_file=root_is_file,
+                                ctx=ctx,
+                                lease_ref=resource_lock,
+                            )
+                            local_artifact_files = list(apply_result.files)
+                            local_incremental_file_md5s = self._apply_result_to_file_md5s(
+                                apply_result, root_uri
+                            )
+                            self._log_commit_summary(
+                                apply_result, root_uri=root_uri, is_initial=True
+                            )
+                        else:
+                            await viking_fs.persist_temp_tree(
+                                temp_uri,
+                                root_uri,
+                                ctx=ctx,
+                                lease_ref=resource_lock,
+                            )
                         if not root_is_file:
                             await rewrite_image_uris(
                                 root_uri,
                                 ctx=ctx,
                                 lease_ref=resource_lock,
                             )
-                        await viking_fs.delete_temp(
-                            parse_result.temp_dir_path,
+                        if artifact_ref is None or artifact_ref.backend != "local":
+                            await viking_fs.delete_temp(
+                                parse_result.temp_dir_path,
+                                ctx=ctx,
+                            )
+                        temp_uri = root_uri
+                        source_committed = True
+                    elif artifact_ref is not None:
+                        # Incremental artifact import: the target already exists, so
+                        # only upload changed files and delete removed ones,
+                        # decided by DiffPlan (artifact md5 vs vector-store md5).
+                        artifact_store = self._store_for_parse_artifact(
+                            artifact_ref,
+                            output_store=output_store,
+                            viking_fs=viking_fs,
                             ctx=ctx,
                         )
+                        apply_result = await self._apply_local_incremental(
+                            output_store=artifact_store,
+                            artifact_ref=artifact_ref,
+                            doc_rel=self._artifact_doc_rel(artifact_ref, temp_uri),
+                            root_uri=root_uri,
+                            root_is_file=root_is_file,
+                            ctx=ctx,
+                            lease_ref=resource_lock,
+                            vectorize=bool(kwargs.get("build_index", True)),
+                            ingest_options=ingest_options,
+                            processing_mode=normalize_processing_mode(
+                                kwargs.get("processing_mode")
+                            ),
+                        )
+                        rnfv_artifact_committed = True
+                        local_artifact_doc_rel = self._artifact_doc_rel(artifact_ref, temp_uri)
+                        local_artifact_files = list(apply_result.files)
+                        # Hand the applied change set to post-processing so the
+                        # semantic DAG only re-summarizes/re-vectorizes changed
+                        # files (target-URI keyed), like the content_write path.
+                        local_incremental_changes = self._apply_result_to_changes(
+                            apply_result, root_uri
+                        )
+                        local_incremental_file_md5s = self._apply_result_to_file_md5s(
+                            apply_result, root_uri
+                        )
+                        local_file_abstracts = self._apply_result_to_file_abstracts(
+                            apply_result, root_uri
+                        )
+                        incremental_noop = self._apply_result_is_noop(apply_result)
+                        self._log_commit_summary(apply_result, root_uri=root_uri, is_initial=False)
+                        if not root_is_file and not incremental_noop:
+                            await rewrite_image_uris(
+                                root_uri,
+                                ctx=ctx,
+                                lease_ref=resource_lock,
+                            )
                         temp_uri = root_uri
                         source_committed = True
                 except Exception:
@@ -489,9 +1190,14 @@ class ResourceProcessor:
                     # persist failure here would otherwise orphan the
                     # viking://temp tree with no GC (#2478). Skip when the temp
                     # tree was already persisted + deleted on the success path.
-                    if not source_committed and parse_result.temp_dir_path:
+                    if not source_committed:
                         try:
-                            await get_viking_fs().delete_temp(parse_result.temp_dir_path, ctx=ctx)
+                            await self._cleanup_parse_result_artifact(
+                                parse_result,
+                                output_store=output_store,
+                                viking_fs=get_viking_fs(),
+                                ctx=ctx,
+                            )
                         except Exception:
                             pass
                     raise
@@ -506,14 +1212,49 @@ class ResourceProcessor:
                     except Exception:
                         pass
 
+            if use_context_update_plan and artifact_ref is not None:
+                artifact_store = self._store_for_parse_artifact(
+                    artifact_ref,
+                    output_store=output_store,
+                    viking_fs=get_viking_fs(),
+                    ctx=ctx,
+                )
+                try:
+                    await artifact_store.cleanup(artifact_ref)
+                except Exception as exc:
+                    logger.warning(
+                        "[ResourceProcessor] Failed to clean committed parse artifact %s: %s",
+                        artifact_ref.root,
+                        exc,
+                    )
+                artifact_ref = None
+            else:
+                ensure_artifact_ref = getattr(parse_result, "ensure_artifact_ref", None)
+                if callable(ensure_artifact_ref):
+                    artifact_ref = ensure_artifact_ref()
+            prepared_artifact_ref = artifact_ref.to_dict() if artifact_ref is not None else None
+            if prepared_artifact_ref is not None and artifact_ref.backend == "local":
+                prepared_artifact_ref["resource_rel"] = local_artifact_doc_rel
             prepared = {
                 "root_uri": root_uri,
                 "temp_uri": temp_uri or parse_result.temp_dir_path,
                 "temp_dir_path": parse_result.temp_dir_path,
+                "artifact_ref": prepared_artifact_ref,
                 "source_committed": source_committed,
                 "target_preexisting": target_preexisting,
                 "is_code_repo": parse_result.source_format == "repository",
                 "root_is_file": root_is_file,
+                # For local incremental commits, the changed-file set is already
+                # Legacy non-plan paths still use this explicit change set.
+                "changes": local_incremental_changes,
+                "file_md5s": local_incremental_file_md5s,
+                "file_abstracts": local_file_abstracts,
+                "artifact_files": local_artifact_files,
+                "incremental_noop": incremental_noop,
+                "context_update_plan": (
+                    context_update_plan.to_dict() if context_update_plan is not None else None
+                ),
+                "plan_artifact_committed": rnfv_artifact_committed,
                 "semantic_source": self._semantic_source_metadata(
                     path=path,
                     prepared_resource=prepared_resource,
@@ -557,6 +1298,18 @@ class ResourceProcessor:
         root_uri = str(prepared.get("root_uri") or "")
         temp_uri = prepared.get("temp_uri")
         temp_dir_path = prepared.get("temp_dir_path")
+        # Canonical plans contain only final resource URIs. An artifact ref is
+        # present here only for legacy non-plan paths that still need it.
+        artifact_ref_data = prepared.get("artifact_ref")
+        artifact_ref = None
+        if artifact_ref_data is not None:
+            from openviking.parse.output import ParseArtifactRef
+
+            artifact_ref = ParseArtifactRef.from_dict(artifact_ref_data)
+            if artifact_ref.backend not in {"agfs", "local"}:
+                raise ValueError(
+                    f"Unsupported parse artifact backend in post-process: {artifact_ref.backend}"
+                )
         source_committed = bool(prepared.get("source_committed"))
         target_preexisting = bool(prepared.get("target_preexisting"))
         build_index = bool(kwargs.get("build_index", True))
@@ -565,11 +1318,78 @@ class ResourceProcessor:
         root_is_file = bool(prepared.get("root_is_file"))
         ingest_options = IngestOptions.from_value(kwargs.pop("ingest_options", None))
         semantic_source = prepared.get("semantic_source")
-        should_summarize = not root_is_file and not vectors_only and (summarize or build_index)
+        context_update_plan_data = prepared.get("context_update_plan")
+        if context_update_plan_data is not None:
+            from openviking.storage.context_update_plan import ContextUpdatePlan
+
+            context_update_plan = ContextUpdatePlan.from_dict(context_update_plan_data)
+            semantic_plan = (
+                context_update_plan.semantic_plan.to_dict()
+                if context_update_plan.semantic_plan is not None
+                else None
+            )
+            direct_index_actions = context_update_plan.direct_index_actions
+        else:
+            semantic_plan = None
+            direct_index_actions = ()
+        uses_context_update_plan = context_update_plan_data is not None
+        plan_artifact_committed = bool(prepared.get("plan_artifact_committed"))
+        should_summarize = (
+            not root_is_file
+            and not vectors_only
+            and (summarize or build_index)
+            and (not uses_context_update_plan or semantic_plan is not None)
+        )
         should_refresh_file_parent = (
             root_is_file and not vectors_only and (summarize or build_index)
         )
         result: Dict[str, Any] = {"status": "success", "root_uri": root_uri}
+        local_artifact = (
+            artifact_ref
+            if artifact_ref_data is not None and artifact_ref.backend == "local"
+            else None
+        )
+        local_artifact_handed_off = False
+        artifact_cleaned = False
+
+        async def cleanup_artifact_if_owned() -> None:
+            nonlocal artifact_cleaned
+            if artifact_cleaned or artifact_ref is None:
+                return
+            if not plan_artifact_committed and (
+                local_artifact is None or local_artifact_handed_off
+            ):
+                return
+            from openviking.parse.output import AgfsParseOutputStore
+
+            # Local mode reuses the processor's own store seam (test-injectable);
+            # agfs mode builds a temp-backed store on demand.
+            output_store = (
+                self._build_parse_output_store()
+                if artifact_ref.backend == "local"
+                else AgfsParseOutputStore(viking_fs=get_viking_fs(), ctx=ctx)
+            )
+            if output_store is not None:
+                await output_store.cleanup(artifact_ref)
+                artifact_cleaned = True
+
+        if prepared.get("incremental_noop") and not direct_index_actions:
+            try:
+                await cleanup_artifact_if_owned()
+            finally:
+                if resource_lock is not None:
+                    await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
+            return result
+
+        if direct_index_actions:
+            try:
+                await self._enqueue_index_actions(direct_index_actions, ctx=ctx)
+            except BaseException:
+                await cleanup_artifact_if_owned()
+                if resource_lock is not None:
+                    await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
+                    resource_lock = None
+                raise
 
         if should_summarize:
             stage_start = time.perf_counter()
@@ -587,8 +1407,24 @@ class ResourceProcessor:
                         ingest_options=ingest_options,
                         semantic_source=semantic_source,
                         generation_trigger="resource_ingest",
+                        changes=prepared.get("changes"),
+                        file_md5s=prepared.get("file_md5s"),
+                        file_abstracts=prepared.get("file_abstracts"),
+                        artifact_ref=(
+                            artifact_ref_data
+                            if semantic_plan is None and local_artifact is not None
+                            else None
+                        ),
+                        artifact_files=(
+                            prepared.get("artifact_files") if semantic_plan is None else None
+                        ),
+                        semantic_plan=semantic_plan,
                         **kwargs,
                     )
+                    if semantic_plan is not None and summary_result.get("status") != "success":
+                        raise RuntimeError(
+                            str(summary_result.get("message") or "semantic plan enqueue failed")
+                        )
                     if (
                         resource_lock is not None
                         and summary_result.get("status") == "success"
@@ -596,10 +1432,29 @@ class ResourceProcessor:
                     ):
                         await get_viking_fs()._async_agfs.pathlock_handoff(resource_lock)
                         resource_lock = None
+                    local_artifact_handed_off = (
+                        semantic_plan is None
+                        and local_artifact is not None
+                        and summary_result.get("status") == "success"
+                        and summary_result.get("enqueued_count", 0) > 0
+                    )
+                    if semantic_plan is not None and (
+                        summary_result.get("status") == "success"
+                        and summary_result.get("enqueued_count", 0) > 0
+                    ):
+                        await cleanup_artifact_if_owned()
             except Exception as exc:
                 logger.error("Summarization failed: %s", exc)
-                result["warnings"] = [f"Summarization failed: {exc}"]
                 stage_status = "error"
+                if semantic_plan is not None:
+                    try:
+                        await cleanup_artifact_if_owned()
+                    finally:
+                        if resource_lock is not None:
+                            await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
+                            resource_lock = None
+                    raise
+                result["warnings"] = [f"Summarization failed: {exc}"]
             finally:
                 try:
                     ResourceIngestionEventDataSource.record_stage(
@@ -641,7 +1496,7 @@ class ResourceProcessor:
                         )
                     if temp_dir_path:
                         await viking_fs.delete_temp(temp_dir_path, ctx=ctx)
-                if vectors_only:
+                if vectors_only and not uses_context_update_plan:
                     if sync_deleted_files or sync_deleted_dirs:
                         await self._delete_removed_resource_vectors(
                             files=sync_deleted_files,
@@ -655,8 +1510,10 @@ class ResourceProcessor:
                         skip_vectorization=not build_index,
                         ingest_options=ingest_options,
                         created=not target_preexisting,
+                        file_md5=(prepared.get("file_md5s") or {}).get(root_uri),
+                        file_abstract=(prepared.get("file_abstracts") or {}).get(root_uri, ""),
                     )
-                elif build_index:
+                elif build_index and not uses_context_update_plan:
                     if root_is_file:
                         await self._vectorize_resource_file(
                             root_uri,
@@ -665,35 +1522,66 @@ class ResourceProcessor:
                             creator_acl_grant=(
                                 CreatorAclGrant.DIRECT if not target_preexisting else None
                             ),
+                            file_md5=(prepared.get("file_md5s") or {}).get(root_uri),
                         )
                     elif vectors_only:
-                        await self._vectorize_resource_files(
-                            root_uri, ctx=ctx, ingest_options=ingest_options
+                        await self._vectorize_prepared_files(
+                            prepared,
+                            root_uri,
+                            local_artifact=local_artifact,
+                            ingest_options=ingest_options,
+                            ctx=ctx,
                         )
+            except BaseException:
+                await cleanup_artifact_if_owned()
+                raise
             finally:
                 await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
         elif should_refresh_file_parent:
-            await self._get_summarizer().refresh_file_parent(
-                file_uri=root_uri,
-                ctx=ctx,
-                skip_vectorization=not build_index,
-                ingest_options=ingest_options,
-                created=not target_preexisting,
-            )
-        elif vectors_only or root_is_file:
+            try:
+                await self._get_summarizer().refresh_file_parent(
+                    file_uri=root_uri,
+                    ctx=ctx,
+                    skip_vectorization=not build_index,
+                    ingest_options=ingest_options,
+                    created=not target_preexisting,
+                    file_md5=(prepared.get("file_md5s") or {}).get(root_uri),
+                    file_abstract=(prepared.get("file_abstracts") or {}).get(root_uri, ""),
+                )
+            except BaseException:
+                await cleanup_artifact_if_owned()
+                raise
+        elif (vectors_only or root_is_file) and not uses_context_update_plan:
             if not build_index:
+                await cleanup_artifact_if_owned()
                 return result
             if root_is_file:
-                await self._vectorize_resource_file(
-                    root_uri,
-                    ctx=ctx,
-                    ingest_options=ingest_options,
-                    creator_acl_grant=(CreatorAclGrant.DIRECT if not target_preexisting else None),
-                )
+                try:
+                    await self._vectorize_resource_file(
+                        root_uri,
+                        ctx=ctx,
+                        ingest_options=ingest_options,
+                        creator_acl_grant=(
+                            CreatorAclGrant.DIRECT if not target_preexisting else None
+                        ),
+                        file_md5=(prepared.get("file_md5s") or {}).get(root_uri),
+                    )
+                except BaseException:
+                    await cleanup_artifact_if_owned()
+                    raise
             else:
-                await self._vectorize_resource_files(
-                    root_uri, ctx=ctx, ingest_options=ingest_options
-                )
+                try:
+                    await self._vectorize_prepared_files(
+                        prepared,
+                        root_uri,
+                        local_artifact=local_artifact,
+                        ingest_options=ingest_options,
+                        ctx=ctx,
+                    )
+                except BaseException:
+                    await cleanup_artifact_if_owned()
+                    raise
+        await cleanup_artifact_if_owned()
         return result
 
     @staticmethod
@@ -719,6 +1607,67 @@ class ResourceProcessor:
         else:
             kind = "local"
         return {"kind": kind, "uri": str(path)}
+
+    async def _enqueue_index_actions(self, actions: Any, *, ctx: RequestContext) -> None:
+        from openviking.storage.context_update_plan import IndexOperation
+        from openviking.storage.queuefs import get_queue_manager
+        from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+        from openviking.telemetry import get_current_telemetry
+        from openviking.utils.embedding_utils import _enqueue_embedding_message
+        from openviking.utils.time_utils import get_current_timestamp
+
+        queue_manager = get_queue_manager()
+        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING, allow_create=True)
+        telemetry_id = get_current_telemetry().telemetry_id
+        delete_ids = [
+            action.record_id for action in actions if action.operation == IndexOperation.DELETE
+        ]
+        if delete_ids:
+            message = EmbeddingMsg.for_delete(
+                record_ids=delete_ids,
+                context_data={
+                    "uri": actions[0].uri,
+                    "account_id": ctx.account_id,
+                    "owner_user_id": ctx.user.user_id,
+                },
+                telemetry_id=telemetry_id,
+            )
+            await _enqueue_embedding_message(
+                embedding_queue,
+                message,
+                failure_message="Failed to enqueue planned vector deletes",
+            )
+        for action in actions:
+            if action.operation == IndexOperation.UPSERT:
+                if action.level != int(ContextLevel.DETAIL):
+                    raise ValueError("Direct index upsert only supports file detail records")
+                await self._vectorize_resource_file(
+                    action.uri,
+                    ctx=ctx,
+                    file_md5=action.md5,
+                    scalar_override={**dict(action.fields), "_record_id": action.record_id},
+                    partial_update=False,
+                )
+                continue
+            if action.operation != IndexOperation.UPDATE_FIELDS:
+                continue
+            fields = {**dict(action.fields), "updated_at": get_current_timestamp()}
+            message = EmbeddingMsg.for_update_fields(
+                record_id=action.record_id,
+                fields=fields,
+                context_data={
+                    "uri": action.uri,
+                    "level": action.level,
+                    "account_id": ctx.account_id,
+                    "owner_user_id": ctx.user.user_id,
+                },
+                telemetry_id=telemetry_id,
+            )
+            await _enqueue_embedding_message(
+                embedding_queue,
+                message,
+                failure_message=f"Failed to enqueue scalar update for {action.uri}",
+            )
 
     async def _delete_removed_resource_vectors(
         self,
@@ -760,27 +1709,38 @@ class ResourceProcessor:
         *,
         ctx: RequestContext,
         ingest_options: IngestOptions | None = None,
+        artifact_store: Any = None,
+        artifact_ref: Any = None,
+        artifact_files: Optional[List[str]] = None,
+        file_md5s: Optional[Dict[str, str]] = None,
     ) -> None:
         ingest_options = IngestOptions.from_value(ingest_options)
         viking_fs = get_viking_fs()
-        entries = await viking_fs.tree(
-            root_uri,
-            node_limit=None,
-            level_limit=None,
-            ctx=ctx,
-        )
         files: list[tuple[str, str, str]] = []
-        for entry in entries:
-            entry_uri = entry.get("uri") if isinstance(entry, dict) else None
-            if not entry_uri or entry.get("isDir"):
-                continue
-            name = entry.get("name") or entry_uri.rsplit("/", 1)[-1]
-            if str(name).startswith("."):
-                continue
-            parent = VikingURI(entry_uri).parent
-            if parent is None:
-                continue
-            files.append((entry_uri, str(name), parent.uri))
+        if artifact_files is not None:
+            for rel_path in artifact_files:
+                entry_uri = VikingURI(root_uri).join(rel_path).uri
+                parent = VikingURI(entry_uri).parent
+                if parent is not None:
+                    files.append((entry_uri, rel_path.rsplit("/", 1)[-1], parent.uri))
+        else:
+            entries = await viking_fs.tree(
+                root_uri,
+                node_limit=None,
+                level_limit=None,
+                ctx=ctx,
+            )
+            for entry in entries:
+                entry_uri = entry.get("uri") if isinstance(entry, dict) else None
+                if not entry_uri or entry.get("isDir"):
+                    continue
+                name = entry.get("name") or entry_uri.rsplit("/", 1)[-1]
+                if str(name).startswith("."):
+                    continue
+                parent = VikingURI(entry_uri).parent
+                if parent is None:
+                    continue
+                files.append((entry_uri, str(name), parent.uri))
 
         config = get_openviking_config().queue_workers.add_resource
         concurrency = max(
@@ -792,6 +1752,15 @@ class ResourceProcessor:
         )
 
         async def vectorize(entry_uri: str, name: str, parent_uri: str) -> None:
+            file_content = None
+            if artifact_store is not None and artifact_ref is not None:
+                rel_path = entry_uri[len(root_uri.rstrip("/")) + 1 :]
+                artifact_rel = (
+                    f"{artifact_ref.resource_rel.strip('/')}/{rel_path}"
+                    if artifact_ref.resource_rel
+                    else rel_path
+                )
+                file_content = await artifact_store.read_bytes(artifact_ref, artifact_rel)
             await vectorize_file(
                 file_path=entry_uri,
                 summary_dict={"name": name, "summary": ""},
@@ -799,6 +1768,8 @@ class ResourceProcessor:
                 context_type=context_type_for_uri(entry_uri),
                 ctx=ctx,
                 ingest_options=ingest_options,
+                file_md5=(file_md5s or {}).get(entry_uri),
+                file_content=file_content,
             )
 
         for start in range(0, len(files), concurrency):
@@ -821,6 +1792,9 @@ class ResourceProcessor:
         ctx: RequestContext,
         ingest_options: IngestOptions | None = None,
         creator_acl_grant: CreatorAclGrant | None = None,
+        file_md5: str | None = None,
+        scalar_override: Optional[Dict[str, Any]] = None,
+        partial_update: bool = True,
     ) -> None:
         parent = VikingURI(file_uri).parent
         if parent is None:
@@ -834,6 +1808,9 @@ class ResourceProcessor:
             ctx=ctx,
             ingest_options=IngestOptions.from_value(ingest_options),
             creator_acl_grant=creator_acl_grant,
+            file_md5=file_md5,
+            scalar_override=scalar_override,
+            partial_update=partial_update,
         )
 
     async def reserve_unique_candidate(

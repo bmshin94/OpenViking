@@ -88,6 +88,22 @@ class SemanticProcessor(DequeueHandlerBase):
     """
 
     _stats_lock = threading.Lock()
+
+    @staticmethod
+    async def _cleanup_local_artifact(msg: SemanticMsg) -> None:
+        try:
+            if not msg.artifact_ref:
+                return
+            from openviking.parse.output import ParseArtifactRef, store_for_artifact_ref
+
+            artifact_ref = ParseArtifactRef.from_dict(msg.artifact_ref)
+            if artifact_ref.backend != "local":
+                return
+            store = store_for_artifact_ref(artifact_ref)
+            await store.cleanup(artifact_ref)
+        except Exception as exc:
+            logger.warning("Failed to clean local parse artifact: %s", exc)
+
     _dag_stats_by_telemetry_id: Dict[str, DagStats] = {}
     _dag_stats_by_uri: Dict[str, DagStats] = {}
     _dag_stats_order: List[Tuple[str, str]] = []
@@ -239,6 +255,7 @@ class SemanticProcessor(DequeueHandlerBase):
             logger.error(f"Failed to re-enqueue semantic message: {requeue_err}")
             self._merge_request_stats(msg.telemetry_id, error_count=1)
             get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, str(error))
+            await self._cleanup_local_artifact(msg)
             return ProcessResult.failed(str(error))
         return ProcessResult.requeued()
 
@@ -346,6 +363,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 logger.warning("Skipping semantic generation for root URI: %s", msg.uri)
                 if msg.telemetry_id and msg.id:
                     get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
+                await self._cleanup_local_artifact(msg)
                 return ProcessResult.success()
             if is_semantic_msg_stale(msg):
                 live_file_changes = {
@@ -374,6 +392,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     )
                     if msg.telemetry_id and msg.id:
                         get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
+                    await self._cleanup_local_artifact(msg)
                     return ProcessResult.success()
             # Circuit breaker: if API is known-broken, re-enqueue and wait
             try:
@@ -404,7 +423,7 @@ class SemanticProcessor(DequeueHandlerBase):
                         f"Processing semantic generation for: {msg.uri} (recursive={msg.recursive})"
                     )
 
-                    logger.info(f"Processing semantic generation for: {msg})")
+                    logger.debug("Processing semantic message id=%s uri=%s", msg.id, msg.uri)
 
                     # Resolving the lock scope for a root that was deleted
                     # after enqueue would recreate it (lock metadata needs a
@@ -423,10 +442,44 @@ class SemanticProcessor(DequeueHandlerBase):
                         ),
                     )
                     try:
+                        if msg.plan is not None:
+                            if msg.uri.rstrip("/") != msg.plan.root_uri:
+                                raise ValueError("semantic message URI must match plan root_uri")
+                            if msg.context_type != msg.plan.context_type:
+                                raise ValueError(
+                                    "semantic message context_type must match semantic plan"
+                                )
+                            for run_uri in msg.plan.execution_root_uris():
+                                executor = SemanticDagExecutor(
+                                    processor=self,
+                                    context_type=msg.context_type,
+                                    max_concurrent_llm=self.max_concurrent_llm,
+                                    ctx=current_ctx,
+                                    lock=semantic_lock.lock,
+                                    source=msg.plan.source_metadata,
+                                    semantic_plan=msg.plan,
+                                )
+                                await executor.run(run_uri)
+                                self._cache_dag_stats(
+                                    msg.telemetry_id, run_uri, executor.get_stats()
+                                )
+                                if not executor.stale and msg.plan.propagation.enabled:
+                                    write_result = getattr(
+                                        executor,
+                                        "root_write_result",
+                                        AbstractOverviewWriteResult(
+                                            wrote=True, abstract_body_changed=True
+                                        ),
+                                    )
+                                    await self._enqueue_parent_refresh(
+                                        msg,
+                                        run_uri,
+                                        l0_body_changed=write_result.abstract_body_changed,
+                                    )
                         # Regular memory writes keep their specialized update path.
                         # Callers must explicitly opt into directory aggregation; the
                         # trigger remains descriptive metadata, not an algorithm switch.
-                        if msg.context_type == "memory" and not msg.use_hierarchical_aggregation:
+                        elif msg.context_type == "memory" and not msg.use_hierarchical_aggregation:
                             await self._process_memory_directory(
                                 msg,
                                 ctx=current_ctx,
@@ -465,12 +518,16 @@ class SemanticProcessor(DequeueHandlerBase):
                                     is_incremental = True
                                     target_uri = msg.target_uri
                                     run_uri = msg.target_uri
-                                elif target_exists and msg.changes and msg.uri == msg.target_uri:
+                                elif (
+                                    target_exists
+                                    and msg.changes is not None
+                                    and msg.uri == msg.target_uri
+                                ):
                                     is_incremental = True
                                     logger.info(
                                         f"Using direct incremental semantic update for: {msg.uri}"
                                     )
-                            elif msg.changes:
+                            elif msg.changes is not None:
                                 is_incremental = True
                                 target_uri = msg.uri
                                 logger.info(
@@ -497,6 +554,9 @@ class SemanticProcessor(DequeueHandlerBase):
                                 generation_trigger=msg.generation_trigger,
                                 aggregate_directory=msg.aggregate_directory,
                                 copy_source_uri=msg.copy_source_uri,
+                                file_md5s=msg.file_md5s,
+                                artifact_files=msg.artifact_files,
+                                file_abstracts=msg.file_abstracts,
                             )
                             await executor.run(run_uri)
                             self._cache_dag_stats(
@@ -523,6 +583,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     self._merge_request_stats(msg.telemetry_id, processed=1)
                     logger.info(f"Completed semantic generation for: {msg.uri}")
                     self._circuit_breaker.record_success()
+                    await self._cleanup_local_artifact(msg)
                     return ProcessResult.success()
                 finally:
                     reset_root_observability_context(root_context_token)
@@ -550,6 +611,8 @@ class SemanticProcessor(DequeueHandlerBase):
                     get_request_wait_tracker().mark_semantic_failed(
                         msg.telemetry_id, msg.id, str(e)
                     )
+                if msg is not None:
+                    await self._cleanup_local_artifact(msg)
                 return ProcessResult.failed(str(e))
             elif error_class == ERROR_CLASS_PERMANENT:
                 logger.critical(
@@ -562,6 +625,8 @@ class SemanticProcessor(DequeueHandlerBase):
                     get_request_wait_tracker().mark_semantic_failed(
                         msg.telemetry_id, msg.id, str(e)
                     )
+                if msg is not None:
+                    await self._cleanup_local_artifact(msg)
                 return ProcessResult.failed(str(e))
             else:
                 # Transient or unknown — re-enqueue for retry
@@ -595,6 +660,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 await viking_fs._async_agfs.pathlock_release(lock)
             except Exception as exc:
                 logger.warning("Failed to release cancelled semantic lock: %s", exc)
+        await self._cleanup_local_artifact(msg)
         return ProcessResult.cancelled()
 
     def get_dag_stats(self) -> Optional["DagStats"]:
@@ -957,13 +1023,18 @@ class SemanticProcessor(DequeueHandlerBase):
         file_name: str,
         llm_sem: asyncio.Semaphore,
         ctx: Optional[RequestContext] = None,
+        file_content: Optional[bytes] = None,
     ) -> Dict[str, Any]:
         """Generate summary for a single text file (code, documentation, or other text)."""
         viking_fs = get_viking_fs()
         vlm = get_openviking_config().vlm
         active_ctx = ctx or self._default_ctx
 
-        content = await viking_fs.read_file(file_path, ctx=active_ctx)
+        content = (
+            file_content
+            if file_content is not None
+            else await viking_fs.read_file(file_path, ctx=active_ctx)
+        )
         if isinstance(content, bytes):
             from openviking.utils.embedding_utils import _decode_text_bytes
 
@@ -1035,6 +1106,7 @@ class SemanticProcessor(DequeueHandlerBase):
         file_path: str,
         llm_sem: Optional[asyncio.Semaphore] = None,
         ctx: Optional[RequestContext] = None,
+        file_content: Optional[bytes] = None,
     ) -> Dict[str, Any]:
         """Generate summary for a single file.
 
@@ -1049,11 +1121,15 @@ class SemanticProcessor(DequeueHandlerBase):
         media_type = get_media_type(file_name, None)
         if file_name.lower().endswith(".ts"):
             try:
-                prefix = await get_viking_fs().read(
-                    file_path,
-                    offset=0,
-                    size=MPEG_TS_PROBE_BYTES,
-                    ctx=ctx,
+                prefix = (
+                    file_content[:MPEG_TS_PROBE_BYTES]
+                    if file_content is not None
+                    else await get_viking_fs().read(
+                        file_path,
+                        offset=0,
+                        size=MPEG_TS_PROBE_BYTES,
+                        ctx=ctx,
+                    )
                 )
             except Exception:
                 prefix = None
@@ -1065,7 +1141,9 @@ class SemanticProcessor(DequeueHandlerBase):
         elif media_type == "video":
             return await generate_video_summary(file_path, file_name, llm_sem, ctx=ctx)
         else:
-            return await self._generate_text_summary(file_path, file_name, llm_sem, ctx=ctx)
+            return await self._generate_text_summary(
+                file_path, file_name, llm_sem, ctx=ctx, file_content=file_content
+            )
 
     def _child_summary_line(
         self,
@@ -1553,13 +1631,17 @@ class SemanticProcessor(DequeueHandlerBase):
         ctx: Optional[RequestContext] = None,
         ingest_options: IngestOptions | None = None,
         creator_acl_grant: CreatorAclGrant | None = None,
-    ) -> None:
+        scalar_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
+        partial_update: bool = True,
+        include_abstract: bool = True,
+        include_overview: bool = True,
+    ) -> set[int]:
         """Create directory Context and enqueue to EmbeddingQueue."""
 
         from openviking.utils.embedding_utils import vectorize_directory_meta
 
         active_ctx = ctx or self._default_ctx
-        await vectorize_directory_meta(
+        return await vectorize_directory_meta(
             uri=uri,
             abstract=abstract,
             overview=overview,
@@ -1567,6 +1649,10 @@ class SemanticProcessor(DequeueHandlerBase):
             ctx=active_ctx,
             ingest_options=ingest_options,
             creator_acl_grant=creator_acl_grant,
+            scalar_overrides=scalar_overrides,
+            partial_update=partial_update,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
         )
 
     async def _load_transfer_file_summaries(
@@ -1584,6 +1670,85 @@ class SemanticProcessor(DequeueHandlerBase):
         active_ctx = ctx or self._default_ctx
         return await vector_store.get_l2_abstracts_by_uris(file_paths, ctx=active_ctx)
 
+    async def _update_file_vector_fields(
+        self,
+        *,
+        record_id: str,
+        file_path: str,
+        file_md5: Optional[str],
+        file_content: Optional[bytes],
+        ctx: RequestContext,
+        scalar_fields: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        from openviking.storage.queuefs import get_queue_manager
+        from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+        from openviking.storage.viking_vector_index_backend import VIKINGDB_CONTENT_MAX_SIZE
+        from openviking.telemetry import get_current_telemetry
+        from openviking.utils.embedding_utils import (
+            _coerce_text_file_content,
+            _enqueue_embedding_message,
+        )
+        from openviking.utils.time_utils import get_current_timestamp
+
+        fields: Dict[str, Any] = {"updated_at": get_current_timestamp()}
+        if file_md5:
+            fields["md5"] = file_md5
+        if file_content is not None:
+            fields["content"] = _coerce_text_file_content(file_content)[:VIKINGDB_CONTENT_MAX_SIZE]
+        fields.update(dict(scalar_fields or {}))
+        embedding_msg = EmbeddingMsg.for_update_fields(
+            record_id=record_id,
+            fields=fields,
+            context_data={
+                "uri": file_path,
+                "account_id": ctx.account_id,
+                "owner_user_id": ctx.user.user_id,
+            },
+            telemetry_id=get_current_telemetry().telemetry_id,
+        )
+        queue_manager = get_queue_manager()
+        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING, allow_create=True)
+        return await _enqueue_embedding_message(
+            embedding_queue,
+            embedding_msg,
+            failure_message=f"Failed to enqueue file scalar update for {file_path}",
+        )
+
+    async def _update_vector_fields(
+        self,
+        *,
+        record_id: str,
+        uri: str,
+        level: int,
+        fields: Dict[str, Any],
+        ctx: RequestContext,
+    ) -> bool:
+        from openviking.storage.queuefs import get_queue_manager
+        from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+        from openviking.telemetry import get_current_telemetry
+        from openviking.utils.embedding_utils import _enqueue_embedding_message
+        from openviking.utils.time_utils import get_current_timestamp
+
+        update_fields = {**fields, "updated_at": get_current_timestamp()}
+        embedding_msg = EmbeddingMsg.for_update_fields(
+            record_id=record_id,
+            fields=update_fields,
+            context_data={
+                "uri": uri,
+                "level": level,
+                "account_id": ctx.account_id,
+                "owner_user_id": ctx.user.user_id,
+            },
+            telemetry_id=get_current_telemetry().telemetry_id,
+        )
+        queue_manager = get_queue_manager()
+        embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING, allow_create=True)
+        return await _enqueue_embedding_message(
+            embedding_queue,
+            embedding_msg,
+            failure_message=f"Failed to enqueue vector scalar update for {uri}",
+        )
+
     async def _vectorize_single_file(
         self,
         parent_uri: str,
@@ -1595,12 +1760,16 @@ class SemanticProcessor(DequeueHandlerBase):
         preserve_existing_created_at: bool = False,
         ingest_options: IngestOptions | None = None,
         creator_acl_grant: CreatorAclGrant | None = None,
-    ) -> None:
+        file_md5: Optional[str] = None,
+        file_content: Optional[bytes] = None,
+        scalar_override: Optional[Dict[str, Any]] = None,
+        partial_update: bool = True,
+    ) -> bool:
         """Vectorize a single file using its content or summary."""
         from openviking.utils.embedding_utils import vectorize_file
 
         active_ctx = ctx or self._default_ctx
-        await vectorize_file(
+        return await vectorize_file(
             file_path=file_path,
             summary_dict=summary_dict,
             parent_uri=parent_uri,
@@ -1610,4 +1779,8 @@ class SemanticProcessor(DequeueHandlerBase):
             preserve_existing_created_at=preserve_existing_created_at,
             ingest_options=ingest_options,
             creator_acl_grant=creator_acl_grant,
+            file_md5=file_md5,
+            file_content=file_content,
+            scalar_override=scalar_override,
+            partial_update=partial_update,
         )
