@@ -1821,6 +1821,7 @@ class SemanticProcessor(DequeueHandlerBase):
             ctx=active_ctx,
             ingest_options=ingest_options,
             creator_acl_grant=creator_acl_grant,
+            content_is_body=context_type == "skill",
             **({"meta": skill_meta} if skill_meta is not None else {}),
         )
 

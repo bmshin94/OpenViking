@@ -754,3 +754,48 @@ async def test_skill_package_indexes_nested_content_and_returns_actual_hit(clien
     assert deleted.status_code == 200, deleted.text
     found = await client.post("/api/v1/skills/find", json={"query": "backup recovery"})
     assert found.json()["result"]["skills"] == []
+
+
+async def test_mcp_skill_import_and_vector_rebuild_preserve_l1_frontmatter(client, service):
+    from openviking.core.mcp_converter import mcp_to_skill
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    tool = {
+        "name": "review_calculator",
+        "description": "Perform mathematical calculations",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"expression": {"type": "string", "description": "Expression"}},
+            "required": ["expression"],
+        },
+    }
+    added = await client.post("/api/v1/skills", json={"data": tool, "wait": True, "timeout": 10})
+    assert added.status_code == 200, added.text
+    root = added.json()["result"]["root_uri"]
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+    expected_body = mcp_to_skill(tool)["content"].strip()
+
+    async def assert_indexed_body():
+        for level in (0, 1):
+            records = await service.vikingdb_manager.filter_in_tenant(
+                ctx=ctx, target_directories=[root], level=[level]
+            )
+            assert len(records) == 1
+            if level == 1:
+                assert records[0]["abstract"].strip() == expected_body
+        records = await service.vikingdb_manager.get_context_by_uri(
+            f"{root}/SKILL.md", level=2, ctx=ctx
+        )
+        assert len(records) == 1
+
+    await assert_indexed_body()
+    rebuilt = await client.post(
+        "/api/v1/content/reindex",
+        json={"uri": root, "mode": "vectors_only", "wait": True},
+    )
+    assert rebuilt.status_code == 200, rebuilt.text
+    assert rebuilt.json()["result"]["status"] == "completed"
+    assert rebuilt.json()["result"]["failed_records"] == 0
+    assert rebuilt.json()["result"]["rebuilt_records"] == 3
+    await assert_indexed_body()

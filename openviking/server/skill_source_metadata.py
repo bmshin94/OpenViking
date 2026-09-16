@@ -75,24 +75,3 @@ async def read_skill_source_metadata(
     metadata["tracked"] = True
     metadata["metadata_uri"] = uri
     return metadata
-
-
-async def persist_skill_source_metadata(
-    service,
-    ctx: RequestContext,
-    result: Dict[str, Any],
-    source: Optional[Dict[str, Any]],
-) -> None:
-    record = _source_record(result, source)
-    if record is None:
-        return
-    uri, content = record
-    viking_fs = getattr(service, "viking_fs", None)
-    if viking_fs is not None:
-        await viking_fs.write(uri, content, ctx=ctx)
-        return
-
-    try:
-        await service.fs.write(uri=uri, content=content, ctx=ctx, mode="replace", wait=True)
-    except Exception:
-        await service.fs.write(uri=uri, content=content, ctx=ctx, mode="create", wait=True)

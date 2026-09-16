@@ -562,39 +562,26 @@ class SkillProcessor:
         abstract: str,
         overview: str,
         ctx: RequestContext,
-        lease_ref: Optional[Dict[str, Any]] = None,
+        lease_ref: Dict[str, Any],
     ):
         """Write main skill content to VikingFS."""
-        if lease_ref is not None:
-            from openviking.storage.abstract_overview import write_abstract_overview
+        from openviking.storage.abstract_overview import write_abstract_overview
 
-            await viking_fs.write_file(
-                f"{skill_dir_uri}/SKILL.md",
-                SkillLoader.to_skill_md(skill_dict),
-                ctx=ctx,
-                lease_ref=lease_ref,
-            )
-            await write_abstract_overview(
-                viking_fs=viking_fs,
-                dir_uri=skill_dir_uri,
-                abstract=abstract,
-                overview=overview,
-                ctx=ctx,
-                lock=lease_ref,
-                is_stale=lambda: False,
-                metadata={
-                    "generated_by": {"component": "SkillProcessor", "trigger": "skill_ingest"}
-                },
-            )
-            return
-        await viking_fs.write_context(
-            uri=skill_dir_uri,
-            content=SkillLoader.to_skill_md(skill_dict),
+        await viking_fs.write_file(
+            f"{skill_dir_uri}/SKILL.md",
+            SkillLoader.to_skill_md(skill_dict),
+            ctx=ctx,
+            lease_ref=lease_ref,
+        )
+        await write_abstract_overview(
+            viking_fs=viking_fs,
+            dir_uri=skill_dir_uri,
             abstract=abstract,
             overview=overview,
-            content_filename="SKILL.md",
-            is_leaf=False,
             ctx=ctx,
+            lock=lease_ref,
+            is_stale=lambda: False,
+            metadata={"generated_by": {"component": "SkillProcessor", "trigger": "skill_ingest"}},
         )
 
     async def _write_auxiliary_files(

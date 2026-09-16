@@ -1555,6 +1555,7 @@ class ReindexExecutor:
                         include_abstract=bool(abstract),
                         include_overview=bool(overview),
                         ingest_options=ingest_options,
+                        content_is_body=True,
                         **(
                             {
                                 "meta": await self._skill_meta(

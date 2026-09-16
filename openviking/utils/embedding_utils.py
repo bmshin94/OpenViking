@@ -366,6 +366,8 @@ async def vectorize_directory_meta(
     creator_acl_grant: CreatorAclGrant | None = None,
     include_abstract: bool = True,
     meta: Optional[Dict[str, Any]] = None,
+    *,
+    content_is_body: bool = False,
 ) -> None:
     """
     Vectorize directory metadata (.abstract.md and .overview.md).
@@ -375,8 +377,11 @@ async def vectorize_directory_meta(
     # Callers may provide either freshly generated bodies or raw sidecar bytes
     # read during reindex/import. Normalize at this shared boundary so protected
     # operational metadata never leaks into vector text or rerank scalars.
-    abstract = body_for_preview(abstract)
-    overview = body_for_preview(overview)
+    # Skill producers have already extracted the bodies. Their Markdown may
+    # itself start with YAML frontmatter, which must not be parsed as OKF again.
+    if not content_is_body:
+        abstract = body_for_preview(abstract)
+        overview = body_for_preview(overview)
     first_enqueue_error: Optional[Exception] = None
     try:
         if not ctx:
