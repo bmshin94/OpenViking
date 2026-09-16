@@ -105,6 +105,7 @@ async def test_memory_empty_dir_still_returns_success():
     processor = SemanticProcessor()
 
     fake_fs = MagicMock()
+    fake_fs.exists = AsyncMock(return_value=True)
     fake_fs.ls = AsyncMock(return_value=[])
 
     msg = _make_msg()
@@ -137,6 +138,7 @@ async def test_memory_ls_error_returns_failed():
     processor = SemanticProcessor()
 
     fake_fs = MagicMock()
+    fake_fs.exists = AsyncMock(return_value=True)
     fake_fs.ls = AsyncMock(side_effect=FileNotFoundError("/memories not found"))
 
     msg = _make_msg()
@@ -171,6 +173,7 @@ async def test_memory_ls_transient_error_requeues():
     processor = SemanticProcessor()
 
     fake_fs = MagicMock()
+    fake_fs.exists = AsyncMock(return_value=True)
     fake_fs.ls = AsyncMock(side_effect=RuntimeError("500 Internal Server Error"))
 
     msg = _make_msg(telemetry_id="tel-1")
@@ -207,6 +210,7 @@ async def test_memory_write_error_returns_failed():
     processor = SemanticProcessor()
 
     fake_fs = MagicMock()
+    fake_fs.exists = AsyncMock(return_value=True)
     fake_fs.ls = AsyncMock(return_value=[{"name": "file1.md", "isDir": False}])
     fake_fs.read_file = AsyncMock(return_value="some content")
     fake_fs.write_file = AsyncMock(side_effect=PermissionError("Permission denied"))

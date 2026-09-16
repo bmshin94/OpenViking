@@ -132,7 +132,8 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
         SemanticProcessor, "_resolve_skill_semantic_lock", AsyncMock(return_value=Lease())
     )
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.get_viking_fs", lambda: SimpleNamespace()
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: SimpleNamespace(exists=AsyncMock(return_value=True)),
     )
     monkeypatch.setattr(
         "openviking.storage.collection_schemas.TextEmbeddingHandler", lambda _: SimpleNamespace()

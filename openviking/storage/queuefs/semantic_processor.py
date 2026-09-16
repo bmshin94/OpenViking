@@ -467,6 +467,15 @@ class SemanticProcessor(DequeueHandlerBase):
 
                     logger.info(f"Processing semantic generation for: {msg})")
 
+                    # Resolving a deleted root can recreate it for lock metadata.
+                    # Settle queued ownership before acknowledging skipped work.
+                    if not await get_viking_fs().exists(msg.uri, ctx=current_ctx):
+                        logger.info("Skipping semantic message for missing root: uri=%s", msg.uri)
+                        await work.skip()
+                        if msg.telemetry_id and msg.id:
+                            get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
+                        return ProcessResult.success()
+
                     if not await work.acquire_lock(current_ctx):
                         get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
                         return ProcessResult.success()

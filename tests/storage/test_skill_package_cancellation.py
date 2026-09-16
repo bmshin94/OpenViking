@@ -266,7 +266,8 @@ async def test_semantic_cancel_drains_embeddings_before_releasing_package(monkey
         SemanticProcessor, "_resolve_skill_semantic_lock", AsyncMock(return_value=Lease())
     )
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.get_viking_fs", lambda: SimpleNamespace()
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: SimpleNamespace(exists=AsyncMock(return_value=True)),
     )
     worker = asyncio.create_task(SemanticProcessor().on_dequeue({"data": msg.to_json()}))
     await asyncio.wait_for(started.wait(), 1)
