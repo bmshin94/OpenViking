@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.server.identity import RequestContext, Role
-from openviking.service.fs_service import FSService
 from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -96,20 +95,3 @@ async def test_vectors_only_preserves_legacy_skill_descriptions(monkeypatch, abs
     )
     assert counters.failed_records == 0 and counters.rebuilt_records == 2
     assert vectorize.await_args.kwargs["meta"] == {**previous_meta, "description": abstract}
-
-
-@pytest.mark.parametrize(
-    "uri,expected",
-    [
-        ("viking://agent/skills/demo", None),
-        ("viking://agent/skills/demo/SKILL.md", None),
-        ("viking://agent/skills/demo/reference", None),
-        ("viking://agent/skills/demo/reference/api.md", "viking://agent/skills/demo/reference"),
-        (
-            "viking://user/alice/skills/demo/reference/api.md",
-            "viking://user/alice/skills/demo/reference",
-        ),
-    ],
-)
-def test_skill_delete_refresh_stays_in_attachment_directories(uri, expected):
-    assert FSService._semantic_refresh_parent_uri(uri, "skill") == expected

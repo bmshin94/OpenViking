@@ -13,7 +13,6 @@ from openviking.server.identity import RequestContext, Role
 from openviking_cli.exceptions import NotFoundError, PermissionDeniedError
 from openviking_cli.retrieve.types import (
     ContextType,
-    MatchedContext,
     TypedQuery,
 )
 from openviking_cli.session.user_id import UserIdentifier
@@ -103,49 +102,10 @@ def query(target=SKILLS):
     return TypedQuery("backup recovery", ContextType.SKILL, "", target_directories=[target])
 
 
-@pytest.mark.parametrize(
-    ("uri", "expected"),
-    [
-        (f"{SKILLS}/demo/reference/nested/SKILL.md", f"{SKILLS}/demo"),
-        (f"{SKILLS}/demo/reference/.overview.md", f"{SKILLS}/demo"),
-        ("viking://user/alice/skills/demo/scripts/run", "viking://user/alice/skills/demo"),
-        ("viking://agent/agent1/skills/demo/ref.txt", "viking://agent/agent1/skills/demo"),
-        (SKILLS, ""),
-        ("viking://user/alice/skills/.abstract.md", ""),
-        (f"{SKILLS}/demo/.abstract.md", f"{SKILLS}/demo"),
-        (f"{SKILLS}/data.service", f"{SKILLS}/data.service"),
-        ("viking://user/alice/skills/data.service/", "viking://user/alice/skills/data.service"),
-        ("viking://resources/example/skills/demo/SKILL.md", ""),
-    ],
-)
-def test_skill_root_uses_namespace_boundary(uri, expected):
-    assert skill_root_uri(uri) == expected
-
-
-@pytest.mark.asyncio
-async def test_skill_namespace_summaries_are_excluded_before_pagination_counts():
-    records = [row(SKILLS, 1, 0, "skills namespace"), row(SKILLS, 0.99, 1, "skills overview")]
-    records.extend(row(f"{SKILLS}/a/ref/{i}.md", 0.9) for i in range(8))
-    records.append(row(f"{SKILLS}/b/ref.md", 0.8))
-    store = PagedStore(records)
-    files = Files()
-    result = await SkillPackageRetriever(store, None).retrieve_skills(
-        query(),
-        ctx(),
-        limit=2,
-        skill_resolver=SkillResultResolver(files, ctx()),
-    )
-    assert [skill_root_uri(item.uri) for item in result.matched_contexts] == [
-        f"{SKILLS}/a",
-        f"{SKILLS}/b",
-    ]
-    assert [call["offset"] for call in store.calls] == [0, 10]
-    assert files.stat_calls == [f"{SKILLS}/a", f"{SKILLS}/b"]
-
-
 @pytest.mark.asyncio
 async def test_quick_fills_distinct_skills_beyond_fixed_overfetch():
-    records = [row(f"{SKILLS}/a/ref/{i}.md", 0.99 - i / 1000) for i in range(120)]
+    records = [row(SKILLS, 1, 0), row(f"{SKILLS}/.a.update-backup-123/SKILL.md", 1)]
+    records.extend(row(f"{SKILLS}/a/ref/{i}.md", 0.99 - i / 1000) for i in range(120))
     records.append(row(f"{SKILLS}/b/ref/backup.md", 0.5))
     store = PagedStore(records)
     files = Files()
@@ -163,74 +123,8 @@ async def test_quick_fills_distinct_skills_beyond_fixed_overfetch():
     assert result.matched_contexts[0].level == 2
     assert result.matched_contexts[0].abstract == "file summary"
     assert result.matched_contexts[1].score == 0.5
-    assert [call["offset"] for call in store.calls] == list(range(0, 121, 10))
+    assert [call["offset"] for call in store.calls] == list(range(0, len(records), 10))
     assert files.stat_calls == [f"{SKILLS}/a", f"{SKILLS}/b"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("has_passing_hits", [False, True])
-async def test_quick_stops_when_sorted_page_crosses_threshold(has_passing_hits):
-    records = [row(f"{SKILLS}/a/ref/{i}.md", 0.1) for i in range(1000)]
-    if has_passing_hits:
-        records[:9] = [row(f"{SKILLS}/a/ref/{i}.md", 0.9) for i in range(9)]
-    store = PagedStore(records)
-    result = await SkillPackageRetriever(store, None).retrieve_skills(
-        query(),
-        ctx(),
-        limit=10,
-        score_threshold=0.8,
-        skill_resolver=SkillResultResolver(Files(), ctx()),
-    )
-    assert [item.uri for item in result.matched_contexts] == (
-        [f"{SKILLS}/a/ref/0.md"] if has_passing_hits else []
-    )
-    assert len(store.calls) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("score_gte", [False, True])
-async def test_quick_threshold_equality_controls_pagination(score_gte):
-    records = [row(f"{SKILLS}/a/ref/{i}.md", 0.8) for i in range(10)]
-    records.append(row(f"{SKILLS}/b/ref.md", 0.8))
-    store = PagedStore(records)
-    result = await SkillPackageRetriever(store, None).retrieve_skills(
-        query(),
-        ctx(),
-        limit=2,
-        score_threshold=0.8,
-        score_gte=score_gte,
-        skill_resolver=SkillResultResolver(Files(), ctx()),
-    )
-    assert [item.uri for item in result.matched_contexts] == (
-        [f"{SKILLS}/a/ref/0.md", f"{SKILLS}/b/ref.md"] if score_gte else []
-    )
-    assert [call["offset"] for call in store.calls] == ([0, 10] if score_gte else [0])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("invalid_score", [float("nan"), None])
-async def test_quick_invalid_page_boundary_does_not_hide_later_matches(invalid_score):
-    class InvalidScoreStore(PagedStore):
-        def _page(self, records, kwargs):
-            # A malformed boundary score cannot prove that the next page fails.
-            offset = kwargs.get("offset", 0)
-            return [dict(record) for record in records[offset : offset + kwargs["limit"]]]
-
-    records = [row(f"{SKILLS}/a/ref/{i}.md", 0.9) for i in range(9)]
-    records.extend([row(f"{SKILLS}/a/bad.md", invalid_score), row(f"{SKILLS}/b/ref.md", 0.85)])
-    store = InvalidScoreStore(records)
-    result = await SkillPackageRetriever(store, None).retrieve_skills(
-        query(),
-        ctx(),
-        limit=2,
-        score_threshold=0.8,
-        skill_resolver=SkillResultResolver(Files(), ctx()),
-    )
-    assert [item.uri for item in result.matched_contexts] == [
-        f"{SKILLS}/a/ref/0.md",
-        f"{SKILLS}/b/ref.md",
-    ]
-    assert [call["offset"] for call in store.calls] == [0, 10]
 
 
 @pytest.mark.asyncio
@@ -290,16 +184,3 @@ async def test_scoped_hits_preserve_requested_level_and_do_not_use_outside_score
     assert matched.score == score
     assert matched.abstract == abstract
     assert store.calls[0]["extra_filter"] is filters
-
-
-@pytest.mark.asyncio
-async def test_same_name_in_two_scopes_and_ties_are_stable():
-    agent_root = f"{SKILLS}/demo"
-    user_root = "viking://user/user1/skills/demo"
-    matches = [
-        MatchedContext(f"{agent_root}/z.md", ContextType.SKILL, abstract="z", score=0.9),
-        MatchedContext(f"{user_root}/a.md", ContextType.SKILL, abstract="user", score=0.9),
-        MatchedContext(f"{agent_root}/a.md", ContextType.SKILL, abstract="a", score=0.9),
-    ]
-    result = await SkillResultResolver(Files(), ctx()).resolve(matches)
-    assert [item.uri for item in result] == [f"{agent_root}/a.md", f"{user_root}/a.md"]

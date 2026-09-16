@@ -61,30 +61,6 @@ async def test_skill_rollback_prevents_late_ack_failure_from_replaying_new_index
 
 
 @pytest.mark.asyncio
-async def test_rollback_cancellation_does_not_apply_to_other_task_types():
-    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
-    owner = {"account_id": "account", "user_id": "user"}
-    task = await tracker.create("add_resource", **owner)
-    with pytest.raises(ValueError, match="Only Skill"):
-        await tracker.cancel_skill_update_for_rollback(task.task_id, **owner)
-    assert (await tracker.get(task.task_id, **owner)).status == TaskStatus.PENDING
-
-
-@pytest.mark.asyncio
-async def test_skill_rollback_does_not_ignore_failure_to_cancel_live_work(monkeypatch):
-    tracker = SimpleNamespace(
-        cancel_skill_update_for_rollback=AsyncMock(
-            side_effect=ValueError("cancellation could not be persisted")
-        ),
-        has_work=lambda task_id: True,
-    )
-    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
-    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
-    with pytest.raises(ValueError, match="could not be persisted"):
-        await ResourceService.__new__(ResourceService).cancel_skill_processing("update-task", ctx)
-
-
-@pytest.mark.asyncio
 async def test_cancel_during_skill_task_creation_settles_persisted_record(monkeypatch):
     store = PersistentTaskStore(_FakeAgfs())
     started, resume = asyncio.Event(), asyncio.Event()

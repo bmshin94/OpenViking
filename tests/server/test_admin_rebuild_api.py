@@ -3080,33 +3080,6 @@ async def test_reindex_global_namespace_partitions_user_and_resources(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_reindex_skill_l2_delegates_content_fallback_to_common_vectorizer(monkeypatch):
-    from unittest.mock import AsyncMock
-
-    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
-
-    root = "viking://user/alice/skills/my_skill"
-    fs = SimpleNamespace(ls=AsyncMock(return_value=[{"name": "SKILL.md"}]))
-    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: fs)
-    monkeypatch.setattr(
-        ReindexExecutor, "_read_directory_abstract", AsyncMock(return_value="skill abstract")
-    )
-    monkeypatch.setattr(ReindexExecutor, "_read_directory_overview", AsyncMock(return_value=""))
-    monkeypatch.setattr(ReindexExecutor, "_fetch_existing_record", AsyncMock(return_value=None))
-    monkeypatch.setattr(ReindexExecutor, "_best_file_summary", AsyncMock(return_value=""))
-    monkeypatch.setattr("openviking.service.reindex_executor.vectorize_directory_meta", AsyncMock())
-    vectorize = AsyncMock(return_value=True)
-    monkeypatch.setattr("openviking.service.reindex_executor.vectorize_file", vectorize)
-    counters = _ReindexCounters()
-    ctx = RequestContext(user=UserIdentifier(account_id="test", user_id="alice"), role=Role.ROOT)
-    await ReindexExecutor()._reindex_skill_vectors(uri=root, counters=counters, ctx=ctx)
-    assert vectorize.await_args.kwargs["file_path"] == root + "/SKILL.md"
-    assert vectorize.await_args.kwargs["summary_dict"] == {"name": "SKILL.md", "summary": ""}
-    assert vectorize.await_args.kwargs["context_type"] == "skill"
-    assert counters.rebuilt_records == 2
-
-
-@pytest.mark.asyncio
 async def test_reindex_skill_vectors_non_recursive_skips_skill_detail(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
 

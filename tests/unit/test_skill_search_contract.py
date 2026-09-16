@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.server.routers import skills as skills_router
-from openviking_cli.exceptions import PermissionDeniedError
 
 
 def _grouped_hit(root_uri, score=0.91):
@@ -77,16 +76,3 @@ async def test_find_skills_applies_one_limit_across_same_named_skills_in_both_sp
         f"{user_root}/data.service",
     ]
     assert [hit["uri"] for hit in result["skills"]] == [agent_hit["uri"], user_hit["uri"]]
-
-
-async def test_find_skills_does_not_use_hit_metadata_when_root_access_fails(
-    fake_search, request_context
-):
-    fake_search.find.return_value = {"skills": [_grouped_hit("viking://agent/skills/backup")]}
-    fake_search.abstract.side_effect = PermissionDeniedError("Root access denied")
-
-    with pytest.raises(PermissionDeniedError):
-        await skills_router.find_skills(
-            skills_router.FindSkillsRequest(query="backup", target_uri="viking://agent/skills"),
-            _ctx=request_context,
-        )

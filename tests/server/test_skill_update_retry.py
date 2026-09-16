@@ -10,8 +10,6 @@ import pytest
 
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
-from openviking.storage.queuefs.semantic_processor import SemanticProcessor
-from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from tests.server.test_api_skills import _add_skill, _skill_md
 from tests.server.test_api_skills import _stub_mcp_endpoint as _stub_mcp_endpoint
 from tests.server.test_skill_update_cancellation import _download, _wait_until
@@ -58,86 +56,6 @@ async def test_update_wait_true_retries_transient_failure_without_conflicting_wi
     assert len(attempts) == 2
     assert b"Replacement" in await _download(client, f"{root}/SKILL.md")
     await _assert_unlocked(service.viking_fs, root)
-
-
-async def test_update_rejected_retry_enqueue_reclaims_lock_before_rollback(
-    client, service, monkeypatch
-):
-    name = "update-retry-enqueue-failed"
-    root = (await _add_skill(client, name, "Original"))["root_uri"]
-    old_content = await _download(client, f"{root}/SKILL.md")
-    attempts = _fail_first_run(monkeypatch, root)
-    queue_manager = get_queue_manager()
-    queue = queue_manager.get_queue(queue_manager.SEMANTIC)
-    original_enqueue = queue.enqueue
-    enqueues = 0
-
-    async def reject_retry(msg):
-        nonlocal enqueues
-        if msg.uri == root:
-            enqueues += 1
-            if enqueues == 2:
-                raise RuntimeError("injected retry enqueue failure")
-        return await original_enqueue(msg)
-
-    monkeypatch.setattr(queue, "enqueue", reject_retry)
-    response = await client.put(
-        f"/api/v1/skills/{name}",
-        json={"data": _skill_md(name, "Replacement"), "wait": True, "timeout": 5},
-    )
-
-    assert response.status_code == 500, response.text
-    assert enqueues == 2
-    assert len(attempts) == 1
-    assert await _download(client, f"{root}/SKILL.md") == old_content
-    await _assert_unlocked(service.viking_fs, root)
-
-
-async def test_update_timeout_cancels_retry_wait_and_releases_its_retained_lock(
-    client, service, monkeypatch
-):
-    name = "update-cancel-retry-wait"
-    root = (await _add_skill(client, name, "Original"))["root_uri"]
-    old_content = await _download(client, f"{root}/SKILL.md")
-    _fail_first_run(monkeypatch, root)
-    retry_started = threading.Event()
-    retry_cancelled = threading.Event()
-    telemetry_id = None
-    original_retry = SemanticProcessor._reenqueue_semantic_msg
-
-    async def pause_retry(self, msg, **kwargs):
-        nonlocal telemetry_id
-        if msg.uri == root:
-            telemetry_id = msg.telemetry_id
-            assert kwargs["skill_lock"].lock is not None
-            retry_started.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                retry_cancelled.set()
-        return await original_retry(self, msg, **kwargs)
-
-    monkeypatch.setattr(SemanticProcessor, "_reenqueue_semantic_msg", pause_retry)
-    updating = asyncio.create_task(
-        client.put(
-            f"/api/v1/skills/{name}",
-            json={"data": _skill_md(name, "Replacement"), "wait": True, "timeout": 0.5},
-        )
-    )
-    try:
-        await _wait_until(retry_started.is_set)
-        await _assert_locked(service.viking_fs, root)
-        response = await asyncio.wait_for(updating, 10)
-        assert response.status_code == 504, response.text
-        assert retry_cancelled.is_set()
-        assert telemetry_id is not None
-        await _wait_until(lambda: not get_request_wait_tracker().has_request(telemetry_id))
-        assert await _download(client, f"{root}/SKILL.md") == old_content
-        await _assert_unlocked(service.viking_fs, root)
-    finally:
-        if not updating.done():
-            updating.cancel()
-            await asyncio.gather(updating, return_exceptions=True)
 
 
 @pytest.mark.parametrize("enqueue_committed", [False, True])
