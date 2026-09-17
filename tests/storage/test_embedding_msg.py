@@ -31,6 +31,16 @@ def test_embedding_msg_roundtrip_preserves_id_for_request_wait_tracker():
         tracker.cleanup(telemetry_id)
 
 
+def test_embedding_msg_roundtrip_preserves_queue_enqueue_time():
+    msg = EmbeddingMsg(
+        "hello",
+        {"uri": "viking://resources/demo"},
+        queue_enqueued_at=123.456,
+    )
+
+    assert EmbeddingMsg.from_dict(msg.to_dict()).queue_enqueued_at == 123.456
+
+
 def test_legacy_embedding_msg_defaults_to_embed_and_upsert():
     restored = EmbeddingMsg.from_dict(
         {

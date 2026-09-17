@@ -309,12 +309,12 @@ def test_reuse_entry_rejects_index_mutation():
 @pytest.mark.asyncio
 async def test_resolver_compares_missing_fingerprints_with_bounded_reads():
     from openviking.storage.resource_rnfv import (
+        FormalEntry,
         FormalTreeSnapshot,
         NewArtifactSnapshot,
         NewEntry,
         RequestIntent,
         RNFVSnapshot,
-        TargetFile,
         VectorIndexSnapshot,
     )
 
@@ -322,7 +322,7 @@ async def test_resolver_compares_missing_fingerprints_with_bounded_reads():
     snapshot = RNFVSnapshot(
         RequestIntent("viking://resources/repo", "semantic_and_vectors"),
         NewArtifactSnapshot({p: NewEntry() for p in paths}),
-        FormalTreeSnapshot({p: TargetFile() for p in paths}),
+        FormalTreeSnapshot({p: FormalEntry() for p in paths}),
         VectorIndexSnapshot({}, frozenset({"id", "uri", "level", "md5"})),
     )
     active = peak = 0
@@ -1143,12 +1143,12 @@ async def test_snapshot_builder_returns_one_canonical_context_plan():
 async def test_snapshot_builder_hydrates_scalars_for_vectors_only_upsert():
     from openviking.storage.context_update_plan import build_context_update_plan_from_snapshot
     from openviking.storage.resource_rnfv import (
+        FormalEntry,
         FormalTreeSnapshot,
         NewArtifactSnapshot,
         NewEntry,
         RequestIntent,
         RNFVSnapshot,
-        TargetFile,
         VectorIndexSnapshot,
         VectorRecordSnapshot,
     )
@@ -1164,7 +1164,7 @@ async def test_snapshot_builder_hydrates_scalars_for_vectors_only_upsert():
     snapshot = RNFVSnapshot(
         request=RequestIntent(root, "vectors_only"),
         new=NewArtifactSnapshot({"a.py": NewEntry(md5="new")}),
-        formal=FormalTreeSnapshot({"a.py": TargetFile()}),
+        formal=FormalTreeSnapshot({"a.py": FormalEntry()}),
         vectors=VectorIndexSnapshot(
             {record.record_id: record},
             frozenset({"id", "uri", "level", "md5", "abstract"}),
@@ -1205,12 +1205,12 @@ async def test_snapshot_builder_hydrates_scalars_for_vectors_only_upsert():
 async def test_file_root_plan_uses_file_refresh_without_directory_semantic_tree():
     from openviking.storage.context_update_plan import build_context_update_plan_from_snapshot
     from openviking.storage.resource_rnfv import (
+        FormalEntry,
         FormalTreeSnapshot,
         NewArtifactSnapshot,
         NewEntry,
         RequestIntent,
         RNFVSnapshot,
-        TargetFile,
         VectorIndexSnapshot,
         VectorRecordSnapshot,
     )
@@ -1222,7 +1222,7 @@ async def test_file_root_plan_uses_file_refresh_without_directory_semantic_tree(
     snapshot = RNFVSnapshot(
         RequestIntent(root, "semantic_and_vectors"),
         NewArtifactSnapshot({"": NewEntry(md5="new")}),
-        FormalTreeSnapshot({"": TargetFile()}),
+        FormalTreeSnapshot({"": FormalEntry()}),
         VectorIndexSnapshot({"report-l2": record}, frozenset({"id", "uri", "level", "md5"})),
     )
     vikingdb = AsyncMock()
@@ -1381,6 +1381,9 @@ async def test_hydration_reads_summaries_before_full_scalars_for_active_records(
 
 @pytest.mark.asyncio
 async def test_content_executor_uploads_files_with_bounded_concurrency():
+    from unittest.mock import patch
+
+    import openviking.utils.async_utils as async_utils
     from openviking.storage.context_update_plan import (
         ContentTreeAction,
         execute_content_tree_actions,
@@ -1421,15 +1424,18 @@ async def test_content_executor_uploads_files_with_bounded_concurrency():
         )
         for index in range(8)
     )
-    await execute_content_tree_actions(
-        actions,
-        store=Store(),
-        artifact_ref=object(),
-        target=Target(),
-        concurrency=3,
-    )
+    create_task = asyncio.create_task
+    with patch.object(async_utils.asyncio, "create_task", wraps=create_task) as created:
+        await execute_content_tree_actions(
+            actions,
+            store=Store(),
+            artifact_ref=object(),
+            target=Target(),
+            concurrency=3,
+        )
 
     assert peak == 3
+    assert created.call_count == 3
 
 
 @pytest.mark.asyncio

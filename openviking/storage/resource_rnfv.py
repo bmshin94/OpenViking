@@ -51,12 +51,16 @@ CONTROL_BASENAMES = frozenset(
 
 @dataclass(frozen=True)
 class NewEntry:
+    """One parser-artifact path: final file MD5 or a topology-only directory."""
+
     md5: str = ""
     is_dir: bool = False
 
 
 @dataclass(frozen=True)
-class TargetFile:
+class FormalEntry:
+    """One formal-tree path; F records topology, not historical file bytes."""
+
     is_dir: bool = False
 
 
@@ -146,6 +150,8 @@ class FormalTreeSnapshot:
 
 @dataclass(frozen=True)
 class VectorRecordSnapshot:
+    """One V inventory record with actual backend identity and hydrated scalars."""
+
     record_id: str
     uri: str
     relative_path: str
@@ -161,6 +167,8 @@ class VectorRecordSnapshot:
 
 @dataclass(frozen=True)
 class VectorIndexSnapshot:
+    """Complete target-prefix V inventory and the projection used to read it."""
+
     records_by_id: Mapping[str, VectorRecordSnapshot]
     projected_fields: frozenset[str]
     complete: bool = True
@@ -168,6 +176,12 @@ class VectorIndexSnapshot:
 
 @dataclass(frozen=True)
 class RNFVSnapshot:
+    """Immutable R/N/F/V facts consumed by diff resolution and plan compilation.
+
+    R carries only explicit request intent, N/F decide content topology, and V
+    supplies indexed levels, record identities, and selectively hydrated scalars.
+    No later planner step may silently reread those sources.
+    """
     request: RequestIntent
     new: NewArtifactSnapshot
     formal: FormalTreeSnapshot
@@ -196,7 +210,7 @@ __all__ = [
     "RequestIntent",
     "RNFVSnapshot",
     "ScalarIntent",
-    "TargetFile",
+    "FormalEntry",
     "VectorIndexSnapshot",
     "VectorRecordSnapshot",
 ]

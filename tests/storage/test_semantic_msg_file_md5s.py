@@ -26,6 +26,15 @@ class TestSemanticMsgFileMd5s:
         assert msg.file_md5s == {}
         assert SemanticMsg.from_dict(msg.to_dict()).file_md5s == {}
 
+    def test_roundtrip_preserves_queue_enqueue_time(self) -> None:
+        msg = SemanticMsg(
+            uri="viking://resources/x",
+            context_type="resource",
+            queue_enqueued_at=123.456,
+        )
+
+        assert SemanticMsg.from_dict(msg.to_dict()).queue_enqueued_at == 123.456
+
     def test_roundtrip_preserves_local_artifact_snapshot(self) -> None:
         msg = SemanticMsg(
             uri="viking://resources/x",

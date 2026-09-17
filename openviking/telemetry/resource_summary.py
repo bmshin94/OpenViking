@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from .operation import OperationTelemetry
+from .request_wait_tracker import get_request_wait_tracker
 
 
 def _consume_semantic_request_stats(telemetry_id: str):
@@ -71,13 +72,18 @@ def record_resource_queue_metrics(
 
     semantic = _queue_metrics(_consume_semantic_request_stats(telemetry_id))
     embedding = _queue_metrics(_consume_embedding_request_stats(telemetry_id))
+    timing = get_request_wait_tracker().get_queue_timing(telemetry_id)
 
     telemetry.set("queue.semantic.processed", semantic["processed"])
     telemetry.set("queue.semantic.requeue_count", semantic["requeue_count"])
     telemetry.set("queue.semantic.error_count", semantic["error_count"])
+    telemetry.set("queue.semantic.queue_wait.duration_ms", timing["semantic"]["queue_wait_ms"])
+    telemetry.set("queue.semantic.execute.duration_ms", timing["semantic"]["execute_ms"])
     telemetry.set("queue.embedding.processed", embedding["processed"])
     telemetry.set("queue.embedding.requeue_count", embedding["requeue_count"])
     telemetry.set("queue.embedding.error_count", embedding["error_count"])
+    telemetry.set("queue.embedding.queue_wait.duration_ms", timing["embedding"]["queue_wait_ms"])
+    telemetry.set("queue.embedding.execute.duration_ms", timing["embedding"]["execute_ms"])
 
     dag_stats = _consume_semantic_dag_stats(telemetry_id, root_uri)
     if dag_stats is not None:

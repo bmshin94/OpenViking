@@ -1,12 +1,11 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Concrete AGFS write side for :func:`apply_diff_plan`.
+"""Concrete AGFS write side for planned content-tree actions.
 
-``apply_diff_plan`` is backend-agnostic over a duck-typed ``target``. This is the
-real AGFS implementation: it joins artifact-relative paths onto the resource
-root and writes the already-normalized artifact bytes unchanged so the stored
-bytes and their manifest md5 stay identical. Content and index deletion are
-separate operations so callers can order them explicitly.
+This is the real AGFS implementation: it joins artifact-relative paths onto the
+resource root and writes the already-normalized artifact bytes unchanged so the
+stored bytes and their manifest md5 stay identical. Content and index deletion
+are separate operations so callers can order them explicitly.
 
 An initial import is simply "the plan is all added", so the same target serves
 both first-import (full upload) and incremental (diff subset) via one channel.

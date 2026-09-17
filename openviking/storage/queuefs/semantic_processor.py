@@ -5,6 +5,7 @@
 import asyncio
 import re
 import threading
+import time
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, unquote, urlsplit
@@ -348,6 +349,9 @@ class SemanticProcessor(DequeueHandlerBase):
         """Process dequeued SemanticMsg, recursively process all subdirectories."""
         msg: Optional[SemanticMsg] = None
         collector = None
+        execute_started_at: float | None = None
+        queue_wait_ms = 0.0
+        execute_status = "ok"
         try:
             import json
 
@@ -359,6 +363,9 @@ class SemanticProcessor(DequeueHandlerBase):
 
             assert data is not None
             msg = SemanticMsg.from_dict(data)
+            execute_started_at = time.perf_counter()
+            if msg.queue_enqueued_at > 0:
+                queue_wait_ms = max((time.time() - msg.queue_enqueued_at) * 1000.0, 0.0)
             if VikingURI(msg.uri).parent is None:
                 logger.warning("Skipping semantic generation for root URI: %s", msg.uri)
                 if msg.telemetry_id and msg.id:
@@ -476,6 +483,24 @@ class SemanticProcessor(DequeueHandlerBase):
                                         run_uri,
                                         l0_body_changed=write_result.abstract_body_changed,
                                     )
+                            from collections import Counter
+
+                            entries = msg.plan.tree.entries
+                            action_counts = Counter(entry.semantic_action.value for entry in entries)
+                            vector_slots = sum(
+                                slot.operation.value == "upsert"
+                                for entry in entries
+                                for slot in entry.index_slots
+                            )
+                            logger.info(
+                                "[SemanticPlanExecution] root=%s execution_roots=%d "
+                                "semantic_entries=%d actions=%s planned_vector_upserts=%d",
+                                msg.plan.root_uri,
+                                len(msg.plan.execution_root_uris()),
+                                len(entries),
+                                dict(action_counts),
+                                vector_slots,
+                            )
                         # Regular memory writes keep their specialized update path.
                         # Callers must explicitly opt into directory aggregation; the
                         # trigger remains descriptive metadata, not an algorithm switch.
@@ -590,6 +615,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
         except Exception as e:
             if isinstance(e, LockAcquisitionError):
+                execute_status = "requeued"
                 logger.warning(
                     "Lock error processing semantic message, re-enqueueing without "
                     "tripping API circuit breaker: %s",
@@ -602,6 +628,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
             error_class = classify_api_error(e)
             if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
+                execute_status = "error"
                 logger.error(
                     f"Input too large processing semantic message, dropping: {e}",
                     exc_info=True,
@@ -615,6 +642,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     await self._cleanup_local_artifact(msg)
                 return ProcessResult.failed(str(e))
             elif error_class == ERROR_CLASS_PERMANENT:
+                execute_status = "error"
                 logger.critical(
                     f"Permanent API error processing semantic message, dropping: {e}",
                     exc_info=True,
@@ -630,6 +658,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 return ProcessResult.failed(str(e))
             else:
                 # Transient or unknown — re-enqueue for retry
+                execute_status = "requeued"
                 logger.warning(
                     f"Transient API error processing semantic message, re-enqueueing: {e}",
                     exc_info=True,
@@ -638,6 +667,30 @@ class SemanticProcessor(DequeueHandlerBase):
                 if msg is not None:
                     return await self._requeue_semantic_msg_after_error(msg, e)
                 return ProcessResult.failed(str(e))
+        finally:
+            if msg is not None and execute_started_at is not None:
+                tracker = get_request_wait_tracker()
+                record_timing = getattr(tracker, "record_semantic_timing", None)
+                if callable(record_timing):
+                    record_timing(
+                        msg.telemetry_id,
+                        queue_wait_ms=queue_wait_ms,
+                        execute_ms=(time.perf_counter() - execute_started_at) * 1000.0,
+                    )
+                from openviking.metrics.datasources.resource import ResourceIngestionEventDataSource
+
+                ResourceIngestionEventDataSource.record_stage(
+                    stage="semantic_queue_wait",
+                    status=execute_status,
+                    duration_seconds=queue_wait_ms / 1000.0,
+                    account_id=msg.account_id,
+                )
+                ResourceIngestionEventDataSource.record_stage(
+                    stage="semantic_execute",
+                    status=execute_status,
+                    duration_seconds=(time.perf_counter() - execute_started_at),
+                    account_id=msg.account_id,
+                )
 
     async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         """Release a queued semantic lock before cancelled work is ACKed."""
@@ -1075,7 +1128,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 {"file_name": file_name, "content": content, "output_language": output_language},
             )
             async with llm_sem:
-                with bind_telemetry_stage("resource_summarize"):
+                with bind_telemetry_stage("semantic_execute"):
                     summary = await vlm.get_completion_async(prompt)
             return result(summary.strip())
 
@@ -1097,7 +1150,7 @@ class SemanticProcessor(DequeueHandlerBase):
         )
 
         async with llm_sem:
-            with bind_telemetry_stage("resource_summarize"):
+            with bind_telemetry_stage("semantic_execute"):
                 summary = await vlm.get_completion_async(prompt)
         return result(summary.strip())
 
@@ -1496,7 +1549,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 },
             )
 
-            with bind_telemetry_stage("resource_summarize"):
+            with bind_telemetry_stage("semantic_execute"):
                 overview = await vlm.get_completion_async(prompt)
 
             overview = self._replace_link_references(overview, link_map)
@@ -1575,7 +1628,7 @@ class SemanticProcessor(DequeueHandlerBase):
         async def _run_batch(batch_idx: int, prompt: str, batch_link_map: Dict[str, str]) -> None:
             try:
                 async with llm_sem:
-                    with bind_telemetry_stage("resource_summarize"):
+                    with bind_telemetry_stage("semantic_execute"):
                         partial = await vlm.get_completion_async(prompt)
                 partial = self._replace_link_references(partial, batch_link_map)
                 partial_overviews[batch_idx] = partial.strip()
@@ -1611,7 +1664,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     "directory_coverage": directory_coverage,
                 },
             )
-            with bind_telemetry_stage("resource_summarize"):
+            with bind_telemetry_stage("semantic_execute"):
                 overview = await vlm.get_completion_async(prompt)
             overview = self._replace_link_references(overview, link_map)
             return overview.strip()

@@ -45,7 +45,6 @@ from openviking_cli.utils.storage import StoragePath
 if TYPE_CHECKING:
     from openviking.parse.accessors.base import LocalResource
     from openviking.parse.vlm import VLMProcessor
-    from openviking.storage.context_update_plan import ContextUpdatePlan
 
 logger = get_logger(__name__)
 _MAX_FILE_VECTORIZATION_CONCURRENCY = 64
@@ -197,7 +196,7 @@ class ResourceProcessor:
     @staticmethod
     def _store_for_parse_artifact(
         artifact_ref: Any, *, output_store: Any, viking_fs: Any, ctx: RequestContext
-    ) -> "ContextUpdatePlan":
+    ) -> Any:
         if output_store is not None and output_store.backend == artifact_ref.backend:
             return output_store
         from openviking.parse.output import store_for_artifact_ref
@@ -223,6 +222,7 @@ class ResourceProcessor:
         source_metadata: Optional[Dict[str, str]],
     ) -> Any:
         """Resolve and commit one artifact through the canonical update plan."""
+        from openviking.metrics.datasources.resource import ResourceIngestionEventDataSource
         from openviking.storage.context_update_plan import (
             build_context_update_plan_from_snapshot,
             execute_content_tree_actions,
@@ -240,58 +240,130 @@ class ResourceProcessor:
             ctx=ctx,
             lease_ref=lease_ref,
         )
-        artifact_inventory = await prepare_artifact_inventory(
-            output_store,
-            artifact_ref,
-            doc_rel=doc_rel,
-            target_root_uri=root_uri,
-            root_is_file=root_is_file,
+        telemetry = get_current_telemetry()
+        artifact_backend = str(getattr(artifact_ref, "backend", "unknown"))
+        update_plan_started_at = time.perf_counter()
+        try:
+            with telemetry.measure("resource.update_plan.artifact_inventory"):
+                artifact_inventory = await prepare_artifact_inventory(
+                    output_store,
+                    artifact_ref,
+                    doc_rel=doc_rel,
+                    target_root_uri=root_uri,
+                    root_is_file=root_is_file,
+                )
+            plan_processing_mode = (
+                processing_mode
+                if processing_mode == VECTORS_ONLY or summarize or vectorize
+                else VECTORS_ONLY
+            )
+            request = RequestIntent.from_ingest_options(
+                target_uri=root_uri,
+                processing_mode=plan_processing_mode,
+                ingest_options=ingest_options,
+                vectorize=vectorize,
+            )
+            with telemetry.measure("resource.update_plan.rnfv_snapshot"):
+                rnfv = await build_rnfv_snapshot(
+                    viking_fs=get_viking_fs(),
+                    vikingdb=self.vikingdb,
+                    store=output_store,
+                    artifact_ref=artifact_ref,
+                    target_uri=root_uri,
+                    ctx=ctx,
+                    doc_rel=doc_rel,
+                    request_intent=request,
+                    target_preexisting=target_preexisting,
+                    artifact_inventory=artifact_inventory,
+                    root_is_file=root_is_file,
+                )
+            from collections import Counter
+
+            logger.info(
+                "[RNFVSnapshot] target=%s artifact_backend=%s root_is_file=%s "
+                "target_preexisting=%s n_entries=%d f_entries=%d v_records=%d v_levels=%s",
+                root_uri,
+                artifact_backend,
+                root_is_file,
+                target_preexisting,
+                len(rnfv.new.entries),
+                len(rnfv.formal.entries),
+                len(rnfv.vectors.records_by_id),
+                dict(Counter(record.level for record in rnfv.vectors.records_by_id.values())),
+            )
+            with telemetry.measure("resource.update_plan.diff_and_compile"):
+                diff, context_plan = await build_context_update_plan_from_snapshot(
+                    snapshot=rnfv,
+                    store=_DocRelStore(output_store, doc_rel),
+                    artifact_ref=artifact_ref,
+                    target=target,
+                    vikingdb=self.vikingdb,
+                    context_type=context_type_for_uri(root_uri),
+                    is_code_repo=is_code_repo,
+                    account_id=ctx.account_id,
+                    ctx=ctx,
+                    root_preexisting=target_preexisting,
+                    artifact_paths=artifact_inventory.artifact_paths,
+                    ingest_options=ingest_options,
+                    source_metadata=source_metadata,
+                    root_is_file=root_is_file,
+                )
+        except Exception:
+            telemetry.set(
+                "resource.update_plan.duration_ms",
+                (time.perf_counter() - update_plan_started_at) * 1000.0,
+            )
+            ResourceIngestionEventDataSource.record_stage(
+                stage="update_plan",
+                status="error",
+                duration_seconds=time.perf_counter() - update_plan_started_at,
+                account_id=ctx.account_id,
+            )
+            raise
+        telemetry.set(
+            "resource.update_plan.duration_ms",
+            (time.perf_counter() - update_plan_started_at) * 1000.0,
         )
-        plan_processing_mode = (
-            processing_mode
-            if processing_mode == VECTORS_ONLY or summarize or vectorize
-            else VECTORS_ONLY
-        )
-        request = RequestIntent.from_ingest_options(
-            target_uri=root_uri,
-            processing_mode=plan_processing_mode,
-            ingest_options=ingest_options,
-            vectorize=vectorize,
-        )
-        rnfv = await build_rnfv_snapshot(
-            viking_fs=get_viking_fs(),
-            vikingdb=self.vikingdb,
-            store=output_store,
-            artifact_ref=artifact_ref,
-            target_uri=root_uri,
-            ctx=ctx,
-            doc_rel=doc_rel,
-            request_intent=request,
-            target_preexisting=target_preexisting,
-            artifact_inventory=artifact_inventory,
-            root_is_file=root_is_file,
-        )
-        diff, context_plan = await build_context_update_plan_from_snapshot(
-            snapshot=rnfv,
-            store=_DocRelStore(output_store, doc_rel),
-            artifact_ref=artifact_ref,
-            target=target,
-            vikingdb=self.vikingdb,
-            context_type=context_type_for_uri(root_uri),
-            is_code_repo=is_code_repo,
+        ResourceIngestionEventDataSource.record_stage(
+            stage="update_plan",
+            status="ok",
+            duration_seconds=time.perf_counter() - update_plan_started_at,
             account_id=ctx.account_id,
-            ctx=ctx,
-            root_preexisting=target_preexisting,
-            artifact_paths=artifact_inventory.artifact_paths,
-            ingest_options=ingest_options,
-            source_metadata=source_metadata,
-            root_is_file=root_is_file,
         )
-        await execute_content_tree_actions(
-            context_plan.content_tree_actions,
-            store=_DocRelStore(output_store, doc_rel),
-            artifact_ref=artifact_ref,
-            target=target,
+
+        content_commit_started_at = time.perf_counter()
+        try:
+            with telemetry.measure("resource.content_commit"):
+                await execute_content_tree_actions(
+                    context_plan.content_tree_actions,
+                    store=_DocRelStore(output_store, doc_rel),
+                    artifact_ref=artifact_ref,
+                    target=target,
+                )
+        except Exception:
+            ResourceIngestionEventDataSource.record_stage(
+                stage="content_commit",
+                status="error",
+                duration_seconds=time.perf_counter() - content_commit_started_at,
+                account_id=ctx.account_id,
+            )
+            raise
+        ResourceIngestionEventDataSource.record_stage(
+            stage="content_commit",
+            status="ok",
+            duration_seconds=time.perf_counter() - content_commit_started_at,
+            account_id=ctx.account_id,
+        )
+        logger.info(
+            "[ContentTreeCommit] target=%s artifact_backend=%s uploaded_files=%d "
+            "created_dirs=%d deleted_paths=%d replaced_kinds=%d duration_ms=%.3f",
+            root_uri,
+            artifact_backend,
+            sum(action.new_kind == "file" for action in context_plan.content_tree_actions),
+            sum(action.new_kind == "directory" for action in context_plan.content_tree_actions),
+            sum(action.operation.value == "delete" for action in context_plan.content_tree_actions),
+            sum(action.operation.value == "replace_kind" for action in context_plan.content_tree_actions),
+            (time.perf_counter() - content_commit_started_at) * 1000.0,
         )
         self._log_context_update_plan(context_plan)
         self._log_context_commit_summary(
@@ -316,12 +388,15 @@ class ResourceProcessor:
             for slot in entry.index_slots
         )
         logger.info(
-            "[ContextUpdatePlan] root=%s content=%s semantic=%s direct_index=%s index_slots=%s",
+            "[ContextUpdatePlan] root=%s content=%s semantic=%s direct_index=%s index_slots=%s "
+            "semantic_entries=%d execution_roots=%d",
             plan.root_uri,
             dict(content),
             dict(semantic),
             dict(direct),
             {f"{operation}:{trigger}": count for (operation, trigger), count in slots.items()},
+            len(entries),
+            len(plan.semantic_plan.execution_root_uris()) if plan.semantic_plan is not None else 0,
         )
 
     @staticmethod
@@ -503,6 +578,7 @@ class ResourceProcessor:
         ingest_options = IngestOptions.from_value(kwargs.pop("ingest_options", None))
         to_is_directory = bool(kwargs.pop("to_is_directory", False))
         telemetry = get_current_telemetry()
+        metrics_account_id = getattr(ctx, "account_id", None)
 
         async def _set_stage(stage: str) -> None:
             if stage_callback is None:
@@ -511,16 +587,13 @@ class ResourceProcessor:
             if inspect.isawaitable(result):
                 await result
 
-        with telemetry.measure("resource.process"):
+        with telemetry.measure("resource.source_execute"):
             # ============ Phase 1: Parse source and writes to temp viking fs ============
             try:
                 from openviking.metrics.datasources.resource import (
                     ResourceIngestionEventDataSource,
                 )
 
-                parse_start = time.perf_counter()
-                stage_start = time.perf_counter()
-                stage_status = "ok"
                 media_processor = self._get_media_processor()
                 viking_fs = get_viking_fs()
                 # Use reason as instruction fallback so it influences L0/L1
@@ -542,6 +615,7 @@ class ResourceProcessor:
                         source=path,
                         instruction=effective_instruction,
                         prepared_resource=prepared_resource,
+                        _metrics_account_id=metrics_account_id,
                         **kwargs,
                     )
                 result["source_path"] = parse_result.source_path or path
@@ -555,7 +629,6 @@ class ResourceProcessor:
                     result["errors"].extend(
                         parse_result.warnings or ["Parse failed: no content generated"],
                     )
-                    stage_status = "error"
                     return result
 
                 parse_meta = parse_result.meta if isinstance(parse_result.meta, dict) else {}
@@ -581,7 +654,6 @@ class ResourceProcessor:
                             parse_result.temp_dir_path,
                             exc,
                         )
-                    stage_status = "error"
                     return result
 
                 parse_failures = self._directory_parse_failures(parse_meta)
@@ -601,20 +673,12 @@ class ResourceProcessor:
                             parse_result.temp_dir_path,
                             exc,
                         )
-                    stage_status = "error"
                     return result
 
                 if parse_result.warnings and kwargs.get("strict", False):
                     result.setdefault("warnings", []).extend(parse_result.warnings)
 
-                telemetry.set(
-                    "resource.parse.duration_ms",
-                    round((time.perf_counter() - parse_start) * 1000, 3),
-                )
-                telemetry.set("resource.parse.warnings_count", len(parse_result.warnings or []))
-
             except OpenVikingError:
-                stage_status = "error"
                 raise
             except Exception as e:
                 result["status"] = "error"
@@ -624,22 +688,11 @@ class ResourceProcessor:
                     error_message += f" (response_id={error_meta['response_id']})"
                 result["errors"].append(error_message)
                 logger.error(f"[ResourceProcessor] Parse error: {e}")
-                telemetry.set_error("resource_processor.parse", "PROCESSING_ERROR", str(e))
+                telemetry.set_error("resource_processor.parse_artifact", "PROCESSING_ERROR", str(e))
                 import traceback
 
                 traceback.print_exc()
-                stage_status = "error"
                 return result
-            finally:
-                try:
-                    ResourceIngestionEventDataSource.record_stage(
-                        stage="parse",
-                        status=str(stage_status),
-                        duration_seconds=float(time.perf_counter() - stage_start),
-                        account_id=getattr(ctx, "account_id", None),
-                    )
-                except Exception:
-                    pass
 
             # parse_result contains:
             # - root: ResourceNode tree (with L0/L1 in meta)
@@ -648,7 +701,7 @@ class ResourceProcessor:
 
             # ============ Phase 3: TreeBuilder finalizes from temp (scan + move to AGFS) ============
             try:
-                await _set_stage("finalizing")
+                await _set_stage("target_resolve")
                 stage_start = time.perf_counter()
                 stage_status = "ok"
                 finalize_start = time.perf_counter()
@@ -687,13 +740,13 @@ class ResourceProcessor:
                         result["temp_uri"] = context_tree.root.temp_uri
                     root_is_file = bool(getattr(context_tree, "_root_is_file", False))
                 telemetry.set(
-                    "resource.finalize.duration_ms",
+                    "resource.target_resolve.duration_ms",
                     round((time.perf_counter() - finalize_start) * 1000, 3),
                 )
             except Exception as e:
                 result["status"] = "error"
                 result["errors"].append(f"Finalize from temp error: {e}")
-                telemetry.set_error("resource_processor.finalize", "PROCESSING_ERROR", str(e))
+                telemetry.set_error("resource_processor.target_resolve", "PROCESSING_ERROR", str(e))
                 stage_status = "error"
 
                 # Cleanup the parser-owned artifact through its own backend.
@@ -711,7 +764,7 @@ class ResourceProcessor:
             finally:
                 try:
                     ResourceIngestionEventDataSource.record_stage(
-                        stage="finalize",
+                        stage="target_resolve",
                         status=str(stage_status),
                         duration_seconds=float(time.perf_counter() - stage_start),
                         account_id=getattr(ctx, "account_id", None),
@@ -732,8 +785,6 @@ class ResourceProcessor:
             context_update_plan = None
 
             if root_uri and temp_uri:
-                stage_start = time.perf_counter()
-                stage_status = "ok"
                 viking_fs = get_viking_fs()
                 try:
                     if candidate_uri:
@@ -807,7 +858,6 @@ class ResourceProcessor:
                     temp_uri = root_uri
                     source_committed = True
                 except Exception:
-                    stage_status = "error"
                     # Mirror the Phase 3 (finalize) on-error cleanup: a lock or
                     # persist failure here would otherwise orphan the
                     # viking://temp tree with no GC (#2478). Skip when the temp
@@ -823,16 +873,6 @@ class ResourceProcessor:
                         except Exception:
                             pass
                     raise
-                finally:
-                    try:
-                        ResourceIngestionEventDataSource.record_stage(
-                            stage="persist",
-                            status=str(stage_status),
-                            duration_seconds=float(time.perf_counter() - stage_start),
-                            account_id=getattr(ctx, "account_id", None),
-                        )
-                    except Exception:
-                        pass
 
             if artifact_ref is not None:
                 artifact_store = self._store_for_parse_artifact(
@@ -922,6 +962,7 @@ class ResourceProcessor:
                     f"Unsupported parse artifact backend in post-process: {artifact_ref.backend}"
                 )
         source_committed = bool(prepared.get("source_committed"))
+        metrics_account_id = getattr(ctx, "account_id", None)
         target_preexisting = bool(prepared.get("target_preexisting"))
         build_index = bool(kwargs.get("build_index", True))
         processing_mode = normalize_processing_mode(processing_mode)
@@ -982,30 +1023,23 @@ class ResourceProcessor:
                 await output_store.cleanup(artifact_ref)
                 artifact_cleaned = True
 
-        if prepared.get("incremental_noop") and not direct_index_actions:
-            try:
-                await cleanup_artifact_if_owned()
-            finally:
-                if resource_lock is not None:
-                    await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
-            return result
+        derived_enqueue_started_at = time.perf_counter()
+        derived_enqueue_status = "ok"
+        try:
+            with get_current_telemetry().measure("resource.derived_enqueue"):
+                if prepared.get("incremental_noop") and not direct_index_actions:
+                    await cleanup_artifact_if_owned()
+                    if resource_lock is not None:
+                        await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
+                        resource_lock = None
+                    return result
 
-        if direct_index_actions:
-            try:
-                await self._enqueue_index_actions(direct_index_actions, ctx=ctx)
-            except BaseException:
-                await cleanup_artifact_if_owned()
-                if resource_lock is not None:
-                    await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
-                    resource_lock = None
-                raise
+                if direct_index_actions:
+                    await self._enqueue_index_actions(direct_index_actions, ctx=ctx)
 
-        if should_summarize:
-            stage_start = time.perf_counter()
-            stage_status = "ok"
-            try:
-                with get_current_telemetry().measure("resource.summarize"):
-                    summary_result = await self._get_summarizer().summarize(
+                if should_summarize:
+                    try:
+                        summary_result = await self._get_summarizer().summarize(
                         resource_uris=[root_uri],
                         ctx=ctx,
                         skip_vectorization=not build_index,
@@ -1019,44 +1053,41 @@ class ResourceProcessor:
                         semantic_plan=semantic_plan,
                         **kwargs,
                     )
-                    if semantic_plan is not None and summary_result.get("status") != "success":
-                        raise RuntimeError(
-                            str(summary_result.get("message") or "semantic plan enqueue failed")
-                        )
-                    if (
-                        resource_lock is not None
-                        and summary_result.get("status") == "success"
-                        and summary_result.get("enqueued_count", 0) > 0
-                    ):
-                        await get_viking_fs()._async_agfs.pathlock_handoff(resource_lock)
-                        resource_lock = None
-                    if semantic_plan is not None and (
-                        summary_result.get("status") == "success"
-                        and summary_result.get("enqueued_count", 0) > 0
-                    ):
-                        await cleanup_artifact_if_owned()
-            except Exception as exc:
-                logger.error("Summarization failed: %s", exc)
-                stage_status = "error"
-                if semantic_plan is not None:
-                    try:
-                        await cleanup_artifact_if_owned()
-                    finally:
-                        if resource_lock is not None:
-                            await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
+                        if semantic_plan is not None and summary_result.get("status") != "success":
+                            raise RuntimeError(
+                                str(summary_result.get("message") or "semantic plan enqueue failed")
+                            )
+                        if (
+                            resource_lock is not None
+                            and summary_result.get("status") == "success"
+                            and summary_result.get("enqueued_count", 0) > 0
+                        ):
+                            await get_viking_fs()._async_agfs.pathlock_handoff(resource_lock)
                             resource_lock = None
-                    raise
-                result["warnings"] = [f"Summarization failed: {exc}"]
-            finally:
-                try:
-                    ResourceIngestionEventDataSource.record_stage(
-                        stage="summarize",
-                        status=stage_status,
-                        duration_seconds=float(time.perf_counter() - stage_start),
-                        account_id=getattr(ctx, "account_id", None),
-                    )
-                except Exception:
-                    pass
+                        if semantic_plan is not None and (
+                            summary_result.get("status") == "success"
+                            and summary_result.get("enqueued_count", 0) > 0
+                        ):
+                            await cleanup_artifact_if_owned()
+                    except Exception as exc:
+                        logger.error("Semantic enqueue failed: %s", exc)
+                        if semantic_plan is not None:
+                            raise
+                        result["warnings"] = [f"Semantic enqueue failed: {exc}"]
+        except Exception:
+            derived_enqueue_status = "error"
+            await cleanup_artifact_if_owned()
+            if resource_lock is not None:
+                await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
+                resource_lock = None
+            raise
+        finally:
+            ResourceIngestionEventDataSource.record_stage(
+                stage="derived_enqueue",
+                status=derived_enqueue_status,
+                duration_seconds=time.perf_counter() - derived_enqueue_started_at,
+                account_id=metrics_account_id,
+            )
 
         if resource_lock is not None:
             try:
@@ -1189,6 +1220,8 @@ class ResourceProcessor:
         return {"kind": kind, "uri": str(path)}
 
     async def _enqueue_index_actions(self, actions: Any, *, ctx: RequestContext) -> None:
+        from collections import Counter
+
         from openviking.storage.context_update_plan import IndexOperation
         from openviking.storage.queuefs import get_queue_manager
         from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
@@ -1199,6 +1232,7 @@ class ResourceProcessor:
         queue_manager = get_queue_manager()
         embedding_queue = queue_manager.get_queue(queue_manager.EMBEDDING, allow_create=True)
         telemetry_id = get_current_telemetry().telemetry_id
+        operation_counts = Counter(action.operation.value for action in actions)
         delete_ids = [
             action.record_id for action in actions if action.operation == IndexOperation.DELETE
         ]
@@ -1248,6 +1282,12 @@ class ResourceProcessor:
                 message,
                 failure_message=f"Failed to enqueue scalar update for {action.uri}",
             )
+        logger.info(
+            "[DirectIndexActions] root=%s operation_counts=%s action_count=%d",
+            actions[0].uri if actions else "",
+            dict(operation_counts),
+            len(actions),
+        )
 
     async def _delete_removed_resource_vectors(
         self,

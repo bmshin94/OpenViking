@@ -1114,7 +1114,7 @@ class SemanticDagExecutor:
                 if file_content is not None:
                     vectorize_kwargs["file_content"] = file_content
                 manifest_md5 = self._file_md5s.get(file_path.rstrip("/")) or None
-                if file_content is not None and self._generation_trigger == "content_write":
+                if file_content is not None and not manifest_md5:
                     file_md5 = content_md5(file_content)
                 else:
                     file_md5 = manifest_md5

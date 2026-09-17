@@ -8,8 +8,17 @@ from uuid import uuid4
 
 
 class EmbeddingOperation(str, Enum):
+    """Explicit embedding-queue work kinds.
+
+    Only ``EMBED_AND_UPSERT`` calls the embedding model. The other operations
+    make vector-only metadata maintenance and exact deletion queue-native.
+    """
+
+    # Embed the supplied payload and write a complete vector record.
     EMBED_AND_UPSERT = "embed_and_upsert"
+    # Update allowed scalar fields on exactly one existing vector record.
     UPDATE_FIELDS = "update_fields"
+    # Delete one or more exact vector record IDs.
     DELETE = "delete"
 
 
@@ -20,6 +29,13 @@ _UPDATE_FIELD_ALLOWLIST = frozenset(
 
 @dataclass
 class EmbeddingMsg:
+    """Durable embedding-queue message for model or index-only work.
+
+    ``context_data`` holds context identity and normal scalar data for
+    ``EMBED_AND_UPSERT``. ``record_ids``/``update_fields`` make delete and scalar
+    updates explicit rather than encoding them as special embedding payloads.
+    """
+
     message: Optional[Union[str, List[Dict[str, Any]]]]
     context_data: Dict[str, Any]
     id: str = field(default_factory=lambda: str(uuid4()))
@@ -27,6 +43,7 @@ class EmbeddingMsg:
     operation: EmbeddingOperation = EmbeddingOperation.EMBED_AND_UPSERT
     record_ids: List[str] = field(default_factory=list)
     update_fields: Dict[str, Any] = field(default_factory=dict)
+    queue_enqueued_at: float = 0.0
 
     def __init__(
         self,
@@ -36,6 +53,7 @@ class EmbeddingMsg:
         operation: EmbeddingOperation | str = EmbeddingOperation.EMBED_AND_UPSERT,
         record_ids: Optional[List[str]] = None,
         update_fields: Optional[Dict[str, Any]] = None,
+        queue_enqueued_at: float = 0.0,
     ):
         self.id = str(uuid4())
         self.message = message
@@ -44,6 +62,7 @@ class EmbeddingMsg:
         self.operation = EmbeddingOperation(operation)
         self.record_ids = list(record_ids or [])
         self.update_fields = dict(update_fields or {})
+        self.queue_enqueued_at = max(float(queue_enqueued_at or 0.0), 0.0)
         self._validate()
 
     def _validate(self) -> None:
@@ -119,6 +138,7 @@ class EmbeddingMsg:
             operation=data.get("operation", EmbeddingOperation.EMBED_AND_UPSERT.value),
             record_ids=data.get("record_ids"),
             update_fields=data.get("update_fields"),
+            queue_enqueued_at=data.get("queue_enqueued_at", 0.0),
         )
         obj.id = data.get("id", obj.id)
         return obj

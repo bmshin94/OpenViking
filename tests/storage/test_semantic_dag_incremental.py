@@ -666,7 +666,7 @@ async def test_content_write_with_same_abstract_still_updates_file_and_skips_par
 
 
 @pytest.mark.asyncio
-async def test_content_write_recomputes_md5_from_content_read_by_worker(monkeypatch):
+async def test_content_write_keeps_matching_upstream_md5(monkeypatch):
     root_uri = "viking://resources/root"
     changed_uri = f"{root_uri}/a.txt"
     latest_content = "newer content"
@@ -689,7 +689,7 @@ async def test_content_write_recomputes_md5_from_content_read_by_worker(monkeypa
         incremental_update=True,
         target_uri=root_uri,
         changes={"modified": [changed_uri]},
-        file_md5s={changed_uri: "stale-enqueued-md5"},
+        file_md5s={changed_uri: content_md5(latest_content.encode())},
         generation_trigger="content_write",
     )
 
@@ -697,6 +697,39 @@ async def test_content_write_recomputes_md5_from_content_read_by_worker(monkeypa
 
     assert processor.file_contents[("vector", changed_uri)] == latest_content.encode()
     assert processor.file_md5s[changed_uri] == content_md5(latest_content.encode())
+
+
+@pytest.mark.asyncio
+async def test_semantic_generate_hashes_read_content_when_manifest_md5_is_missing(monkeypatch):
+    root_uri = "viking://resources/root"
+    changed_uri = f"{root_uri}/a.txt"
+    content = b"content read by semantic worker"
+    fake_fs = _FakeVikingFS(
+        tree={root_uri: [{"name": "a.txt", "isDir": False}]},
+        file_contents={changed_uri: content},
+    )
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+
+    processor = _FakeProcessor(fake_fs)
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER),
+        incremental_update=True,
+        target_uri=root_uri,
+        changes={"modified": [changed_uri]},
+        generation_trigger="resource_ingest",
+    )
+
+    await executor.run(root_uri)
+
+    assert processor.file_contents[("vector", changed_uri)] == content
+    assert processor.file_md5s[changed_uri] == content_md5(content)
 
 
 @pytest.mark.asyncio

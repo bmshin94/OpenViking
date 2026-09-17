@@ -17,6 +17,14 @@ def test_record_resource_queue_metrics_collects_queue_and_dag_stats(monkeypatch)
         requeue_count = 0
         error_count = 1
 
+    class _Timing:
+        @staticmethod
+        def get_queue_timing(_tid):
+            return {
+                "semantic": {"queue_wait_ms": 12.5, "execute_ms": 30.0},
+                "embedding": {"queue_wait_ms": 8.0, "execute_ms": 20.0},
+            }
+
     class _DagStats:
         total_nodes = 9
         done_nodes = 8
@@ -35,6 +43,10 @@ def test_record_resource_queue_metrics_collects_queue_and_dag_stats(monkeypatch)
         "openviking.telemetry.resource_summary._consume_semantic_dag_stats",
         lambda _tid, _uri: _DagStats(),
     )
+    monkeypatch.setattr(
+        "openviking.telemetry.resource_summary.get_request_wait_tracker",
+        lambda: _Timing(),
+    )
 
     record_resource_queue_metrics(
         telemetry=telemetry,
@@ -47,6 +59,10 @@ def test_record_resource_queue_metrics_collects_queue_and_dag_stats(monkeypatch)
     assert summary["queue"]["semantic"]["error_count"] == 2
     assert summary["queue"]["embedding"]["processed"] == 11
     assert summary["queue"]["embedding"]["error_count"] == 1
+    assert summary["queue"]["semantic"]["queue_wait"]["duration_ms"] == 12.5
+    assert summary["queue"]["semantic"]["execute"]["duration_ms"] == 30.0
+    assert summary["queue"]["embedding"]["queue_wait"]["duration_ms"] == 8.0
+    assert summary["queue"]["embedding"]["execute"]["duration_ms"] == 20.0
     assert summary["semantic_nodes"]["total"] == 9
     assert summary["semantic_nodes"]["done"] == 8
     assert summary["semantic_nodes"]["pending"] == 1

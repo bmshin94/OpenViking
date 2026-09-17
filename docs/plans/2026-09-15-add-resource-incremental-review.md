@@ -440,9 +440,9 @@ new_snapshot = {
 }
 
 formal_tree_snapshot = {
-    "src/api/router.py": TargetFile(is_dir=False),
-    "src/api/schema.py": TargetFile(is_dir=False),
-    "docs/guide.md": TargetFile(is_dir=False),
+    "src/api/router.py": FormalEntry(is_dir=False),
+    "src/api/schema.py": FormalEntry(is_dir=False),
+    "docs/guide.md": FormalEntry(is_dir=False),
 }
 
 vector_snapshot = {

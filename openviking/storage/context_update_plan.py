@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import PurePosixPath
@@ -13,12 +12,12 @@ from typing import Any, Mapping
 from openviking.storage.resource_diff import ContentState, IndexState
 from openviking.storage.resource_rnfv import (
     NON_PORTABLE_VECTOR_RECORD_FIELDS,
+    FormalEntry,
     FormalTreeSnapshot,
     NewArtifactSnapshot,
     NewEntry,
     RequestIntent,
     RNFVSnapshot,
-    TargetFile,
     VectorRecordSnapshot,
 )
 from openviking.storage.vector_ids import vector_record_id
@@ -27,25 +26,44 @@ from openviking_cli.utils import VikingURI
 
 
 class SemanticAction(str, Enum):
+    """Per-node semantic work executed by the minimal semantic tree."""
+
+    # Consume a hydrated existing abstract; do not call a semantic model.
     REUSE = "reuse"
+    # Generate a file abstract from the current formal file contents.
     GENERATE = "generate"
+    # Generate directory L0/L1 bodies from direct child abstracts.
     AGGREGATE = "aggregate"
 
 
 class IndexOperation(str, Enum):
+    """Vector-store operation emitted either directly or after semantic output."""
+
+    # No vector write is needed for this slot.
     NONE = "none"
+    # Write a full record, including newly generated embedding data.
     UPSERT = "upsert"
+    # Remove a precise existing record ID without running an embedding model.
     DELETE = "delete"
+    # Change scalar fields only, preserving the existing vector payload.
     UPDATE_FIELDS = "update_fields"
 
 
 class SemanticOutputCondition(str, Enum):
+    """When a semantic index slot may emit its planned upsert."""
+
+    # Emit once a required semantic output is available, even if no predecessor exists.
     OUTPUT_READY = "output_ready"
+    # Emit only if the generated abstract or overview body changed.
     OUTPUT_CHANGED = "output_changed"
 
 
 class FileVectorSource(str, Enum):
+    """Input selected for a file's embedding request."""
+
+    # Embed the current file body using the configured text-source policy.
     CONTENT = "content"
+    # Prefer the generated file summary when one is available (code repositories).
     SUMMARY_WHEN_AVAILABLE = "summary_when_available"
 
 
@@ -84,6 +102,14 @@ def _validate_index_fields(fields: Mapping[str, Any]) -> None:
 
 @dataclass(frozen=True)
 class IndexSlot:
+    """Planned operation for one semantic node and one vector level.
+
+    Existing record identity and portable scalar fields travel with the slot so a
+    later embedding worker can update the real stored record rather than derive a
+    replacement ID locally. ``DELETE`` and pure ``UPDATE_FIELDS`` actions never
+    belong here because they do not depend on semantic output.
+    """
+
     level: int
     record_id: str
     existing_fields: Mapping[str, Any] | None = None
@@ -131,6 +157,13 @@ class IndexSlot:
 
 @dataclass(frozen=True)
 class SemanticTreeEntry:
+    """A retained node in the serializable minimal semantic-tree closure.
+
+    ``REUSE`` entries provide existing child abstracts needed by an ancestor but
+    do not run work themselves. Active file entries ``GENERATE`` and active
+    directory entries ``AGGREGATE``.
+    """
+
     relative_path: str
     kind: str
     content_state: ContentState
@@ -176,6 +209,8 @@ class SemanticTreeEntry:
 
 @dataclass(frozen=True)
 class SemanticTreeSnapshot:
+    """Compact tree retained after diff closure and vector hydration."""
+
     entries: tuple[SemanticTreeEntry, ...]
 
     def __post_init__(self) -> None:
@@ -192,6 +227,13 @@ class SemanticTreeSnapshot:
 
 @dataclass(frozen=True)
 class SemanticPlan:
+    """Asynchronous semantic/derived-index portion of one context update.
+
+    The plan contains only final resource URIs and hydrated non-vector facts. It
+    must never require a parser artifact, local file path, or another RNFV scan
+    after it has crossed the durable semantic queue boundary.
+    """
+
     root_uri: str
     context_type: str
     tree: SemanticTreeSnapshot
@@ -282,13 +324,24 @@ class SemanticPlan:
 
 
 class ContentTreeOperation(str, Enum):
+    """Synchronous formal-tree mutation performed before queue handoff."""
+
+    # Write a new file or ensure a planned directory exists.
     UPSERT = "upsert"
+    # Remove an existing file or subtree.
     DELETE = "delete"
+    # Delete the old kind before creating the different new kind.
     REPLACE_KIND = "replace_kind"
 
 
 @dataclass(frozen=True)
 class ContentTreeAction:
+    """One synchronous mutation from a parse artifact into the formal tree.
+
+    File writes carry the final artifact-relative source and MD5. Directory
+    actions only establish topology; they do not invent a directory fingerprint.
+    """
+
     operation: ContentTreeOperation
     relative_path: str
     old_kind: str | None = None
@@ -312,6 +365,13 @@ class ContentTreeAction:
 
 @dataclass(frozen=True)
 class IndexAction:
+    """Direct vector operation independent of semantic model output.
+
+    Deletes remove exact inventory IDs. ``UPDATE_FIELDS`` mutates only approved
+    scalars. Direct upserts are restricted to file L2 vectors in vectors-only
+    processing, where no semantic node produces the embedding request.
+    """
+
     operation: IndexOperation
     uri: str
     level: int
@@ -332,6 +392,14 @@ class IndexAction:
 
 @dataclass(frozen=True)
 class ContextUpdatePlan:
+    """Complete execution contract for one resource-tree update.
+
+    Content actions run synchronously under the resource lock. The remaining
+    semantic plan and direct index actions are durable queue work. A no-op plan
+    therefore means no formal-tree mutation, semantic generation, or vector
+    mutation is required.
+    """
+
     root_uri: str
     context_type: str
     content_tree_actions: tuple[ContentTreeAction, ...] = ()
@@ -480,6 +548,12 @@ def _semantic_closure(
     *,
     repair_indexes: bool = True,
 ) -> tuple[set[str], set[str], set[str]]:
+    """Return active nodes, membership-changing parents, and retained closure.
+
+    Active content/index repair nodes and all their ancestors must aggregate.
+    Direct children of every active directory are retained as reusable inputs, so
+    aggregation sees the same sibling set without traversing unchanged subtrees.
+    """
     active: set[str] = set()
     membership_changed: set[str] = set()
 
@@ -642,6 +716,15 @@ def build_context_update_plan(
     source_metadata: Mapping[str, str] | None = None,
     closure: tuple[set[str], set[str], set[str]] | None = None,
 ) -> ContextUpdatePlan:
+    """Compile resolved RNFV facts into synchronous and asynchronous actions.
+
+    Content mutations happen before queue handoff. Semantic-dependent index work
+    becomes ``IndexSlot`` data; pure deletes and scalar-only changes become direct
+    embedding-queue actions. Existing vector record IDs are preserved when an
+    existing same-level record is overwritten. Portable existing scalars may be
+    carried for normal updates; derived content, vectors, and ACL fields always
+    come from the current execution.
+    """
     root_uri = root_uri.rstrip("/")
     records_by_path, duplicate_records = _records_by_path(records)
     active, membership_changed, retained = closure or _semantic_closure(
@@ -852,7 +935,7 @@ def _with_directory_root(snapshot: RNFVSnapshot, *, root_preexisting: bool) -> R
     """Add the logical directory root omitted by artifact/tree walks."""
     new_entries = {"": NewEntry(is_dir=True), **snapshot.new.entries}
     formal_entries = (
-        {"": TargetFile(is_dir=True), **snapshot.formal.entries}
+        {"": FormalEntry(is_dir=True), **snapshot.formal.entries}
         if root_preexisting
         else dict(snapshot.formal.entries)
     )
@@ -976,17 +1059,16 @@ async def execute_content_tree_actions(
     if not file_actions:
         return
     if concurrency is None:
-        from openviking.parse.parsers import upload_utils
+        from openviking.storage.file_operation_concurrency import get_file_operation_concurrency
 
-        concurrency = int(getattr(upload_utils, "_UPLOAD_CONCURRENCY", 8))
-    semaphore = asyncio.Semaphore(max(1, concurrency))
-
+        concurrency = get_file_operation_concurrency()
     async def write(action: ContentTreeAction) -> None:
-        async with semaphore:
-            data = await store.read_bytes(artifact_ref, action.artifact_path)
-            await target.write_file(action.relative_path, data)
+        data = await store.read_bytes(artifact_ref, action.artifact_path)
+        await target.write_file(action.relative_path, data)
 
-    await asyncio.gather(*(write(action) for action in file_actions))
+    from openviking.utils.async_utils import bounded_map
+
+    await bounded_map(file_actions, write, concurrency=max(1, concurrency))
 
 
 __all__ = [

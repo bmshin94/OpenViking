@@ -34,12 +34,12 @@ from typing import Any, Dict, Mapping, Tuple
 from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
 from openviking.storage.resource_rnfv import (
     CONTROL_BASENAMES,
+    FormalEntry,
     FormalTreeSnapshot,
     NewArtifactSnapshot,
     NewEntry,
     RequestIntent,
     RNFVSnapshot,
-    TargetFile,
     VectorIndexSnapshot,
     VectorRecordSnapshot,
 )
@@ -48,27 +48,62 @@ logger = logging.getLogger(__name__)
 
 
 class ContentState(str, Enum):
+    """Relationship between the new artifact (N) and formal tree (F).
+
+    F is the source of truth for whether content currently exists.  Vector
+    records are deliberately not part of this axis; their presence is expressed
+    independently by :class:`IndexState`.
+    """
+
+    # Neither N nor F contains this path.
     ABSENT = "absent"
+    # N and F contain the same file bytes, or the same directory node.
     UNCHANGED = "unchanged"
+    # N contains a path that has no formal file and no prior vector records.
     ADDED = "added"
+    # N and F both contain a file, but their bytes differ.
     MODIFIED = "modified"
+    # F contains a path omitted from N.
     DELETED = "deleted"
+    # N contains a path absent from F while V still has records for that path.
     RESTORE = "restore"
+    # N and F contain the path with different node kinds (file versus directory).
     REPLACE_KIND = "replace_kind"
 
 
 class IndexState(str, Enum):
+    """Health of V for the node kind selected by N/F.
+
+    A file is valid only with L2.  A directory is valid only with both L0 and
+    L1.  This axis is independent from content change, so an unchanged file can
+    still require index repair.
+    """
+
+    # No formal node and no vector record exist for the path.
     ABSENT = "absent"
+    # All and only the levels expected for the current node kind are present.
     COMPLETE = "complete"
+    # None of the levels expected for the current node kind are present.
     MISSING = "missing"
+    # Some expected levels are present, but the complete expected set is not.
     PARTIAL = "partial"
+    # Expected levels exist but are derived from content known to be out of date.
     STALE = "stale"
+    # V has records while neither N nor F has a corresponding content node.
     ORPHAN = "orphan"
+    # V contains a level that is invalid for the current file/directory kind.
     LEVEL_CONFLICT = "level_conflict"
 
 
 @dataclass(frozen=True)
 class ResourceDiffEntry:
+    """One path's independent content and index facts after RNFV resolution.
+
+    ``content_state`` determines formal-tree mutation. ``index_state`` determines
+    vector repair or cleanup. ``md5`` is the final new-file fingerprint when the
+    path is a file; directories intentionally never carry an aggregate MD5.
+    """
+
     relative_path: str
     content_state: ContentState
     index_state: IndexState
@@ -103,6 +138,12 @@ def _index_state(
     content_state: ContentState,
     md5: str | None,
 ) -> IndexState:
+    """Classify V with strict precedence.
+
+    Missing formal/new content makes every remaining vector an orphan. For an
+    existing node, invalid levels win over missing or stale checks; then missing
+    expected levels, then content/fingerprint staleness, and finally complete.
+    """
     if kind is None:
         return IndexState.ORPHAN if records else IndexState.ABSENT
     valid_levels = {2} if kind == "file" else {0, 1}
@@ -132,7 +173,7 @@ async def resolve_resource_diff(
     artifact_ref: Any,
     target: Any,
     artifact_paths: Mapping[str, str] | None = None,
-    concurrency: int = 8,
+    concurrency: int | None = None,
 ) -> ResourceDiffResult:
     """Resolve R/N/F/V into final states, including bounded body fallbacks."""
     snapshot.validate_for_planning()
@@ -148,6 +189,7 @@ async def resolve_resource_diff(
     states: dict[str, tuple[ContentState, str | None]] = {}
     compare_paths: list[str] = []
     hash_paths: list[str] = []
+    md5_fast_path_count = 0
     keys = set(new) | set(formal) | set(records_by_rel)
     for rel_path in sorted(keys):
         new_entry = new.get(rel_path)
@@ -169,6 +211,7 @@ async def resolve_resource_diff(
                     "",
                 )
                 if new_entry.md5 and l2_md5:
+                    md5_fast_path_count += 1
                     state = (
                         ContentState.UNCHANGED if new_entry.md5 == l2_md5 else ContentState.MODIFIED
                     )
@@ -185,15 +228,12 @@ async def resolve_resource_diff(
         else:
             states[rel_path] = (ContentState.ABSENT, None)
 
-    semaphore = asyncio.Semaphore(max(1, concurrency))
-
     async def compare(rel_path: str) -> tuple[str, ContentState, str]:
-        async with semaphore:
-            artifact_path = (artifact_paths or {}).get(rel_path, rel_path)
-            new_bytes, old_bytes = await asyncio.gather(
-                store.read_bytes(artifact_ref, artifact_path),
-                target.read_file(rel_path),
-            )
+        artifact_path = (artifact_paths or {}).get(rel_path, rel_path)
+        new_bytes, old_bytes = await asyncio.gather(
+            store.read_bytes(artifact_ref, artifact_path),
+            target.read_file(rel_path),
+        )
         from openviking.utils.content_hash import content_md5
 
         return (
@@ -203,18 +243,22 @@ async def resolve_resource_diff(
         )
 
     async def hash_new(rel_path: str) -> tuple[str, str]:
-        async with semaphore:
-            artifact_path = (artifact_paths or {}).get(rel_path, rel_path)
-            new_bytes = await store.read_bytes(artifact_ref, artifact_path)
+        artifact_path = (artifact_paths or {}).get(rel_path, rel_path)
+        new_bytes = await store.read_bytes(artifact_ref, artifact_path)
         from openviking.utils.content_hash import content_md5
 
         return rel_path, content_md5(new_bytes)
 
-    for rel_path, state, md5 in await asyncio.gather(
-        *(compare(rel_path) for rel_path in compare_paths)
+    from openviking.storage.file_operation_concurrency import get_file_operation_concurrency
+    from openviking.utils.async_utils import bounded_map
+
+    concurrency = concurrency if concurrency is not None else get_file_operation_concurrency()
+
+    for rel_path, state, md5 in await bounded_map(
+        compare_paths, compare, concurrency=max(1, concurrency)
     ):
         states[rel_path] = (state, md5)
-    for rel_path, md5 in await asyncio.gather(*(hash_new(path) for path in hash_paths)):
+    for rel_path, md5 in await bounded_map(hash_paths, hash_new, concurrency=max(1, concurrency)):
         state, _ = states[rel_path]
         states[rel_path] = (state, md5)
 
@@ -241,11 +285,16 @@ async def resolve_resource_diff(
     content_counts = Counter(entry.content_state.value for entry in resolved.entries.values())
     index_counts = Counter(entry.index_state.value for entry in resolved.entries.values())
     logger.info(
-        "[ResourceDiffResult] target=%s content_states=%s index_states=%s "
-        "body_compared=%d new_files_hashed=%d",
+        "[ResourceDiffResult] target=%s n_entries=%d f_entries=%d v_records=%d "
+        "content_states=%s index_states=%s md5_fast_path=%d body_compared=%d "
+        "new_files_hashed=%d",
         snapshot.request.target_uri,
+        len(new),
+        len(formal),
+        len(snapshot.vectors.records_by_id),
         dict(content_counts),
         dict(index_counts),
+        md5_fast_path_count,
         len(compare_paths),
         len(hash_paths),
     )
@@ -268,15 +317,15 @@ async def read_target_file_snapshot(
     *,
     ctx: Any,
     root_is_file: bool = False,
-) -> Tuple[Dict[str, TargetFile], bool]:
-    """Return ``(rel_path -> TargetFile, complete)`` for the target tree.
+) -> Tuple[Dict[str, FormalEntry], bool]:
+    """Return ``(rel_path -> FormalEntry, complete)`` for the formal tree.
 
     ``complete`` is False when any entry is permission-denied, because a subtree
     we cannot see must not be interpreted as absent (which would drive deletion).
     """
     if root_is_file:
         stat = await viking_fs.stat(target_uri, ctx=ctx, skip_count=True)
-        return {"": TargetFile(is_dir=bool(stat.get("isDir")))}, True
+        return {"": FormalEntry(is_dir=bool(stat.get("isDir")))}, True
 
     entries = await viking_fs.tree(
         target_uri,
@@ -286,7 +335,7 @@ async def read_target_file_snapshot(
         level_limit=None,
         ctx=ctx,
     )
-    files: Dict[str, TargetFile] = {}
+    files: Dict[str, FormalEntry] = {}
     complete = True
     for entry in entries:
         if entry.get("access") == "denied":
@@ -295,7 +344,7 @@ async def read_target_file_snapshot(
         rel_path = str(entry.get("rel_path") or "").strip("/")
         if _is_excluded_rel_path(rel_path):
             continue
-        files[rel_path] = TargetFile(is_dir=bool(entry.get("isDir")))
+        files[rel_path] = FormalEntry(is_dir=bool(entry.get("isDir")))
     return files, complete
 
 
@@ -447,7 +496,7 @@ async def build_rnfv_snapshot(
             store, artifact_ref, doc_rel=doc_rel, root_is_file=root_is_file
         )
 
-    async def read_formal() -> tuple[Dict[str, TargetFile], bool]:
+    async def read_formal() -> tuple[Dict[str, FormalEntry], bool]:
         if not target_preexisting:
             return {}, True
         return await read_target_file_snapshot(

@@ -731,6 +731,9 @@ async def test_semantic_processor_binds_registered_operation_telemetry(monkeypat
     processor = SemanticProcessor()
 
     class FakeVikingFS:
+        async def exists(self, uri, ctx=None):
+            return True
+
         async def ls(self, uri, ctx=None):
             return []
 
@@ -779,6 +782,9 @@ async def test_semantic_processor_binds_metric_account_context(monkeypatch):
     ran = {"value": False}
 
     class FakeVikingFS:
+        async def exists(self, uri, ctx=None):
+            return True
+
         async def ls(self, uri, ctx=None):
             return []
 

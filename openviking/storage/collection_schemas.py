@@ -637,8 +637,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
         embedding_msg: Optional[EmbeddingMsg] = None
         request_failed_message: Optional[str] = None
+        execute_started_at: float | None = None
+        queue_wait_ms = 0.0
+        execute_status = "ok"
         try:
             embedding_msg = EmbeddingMsg.from_json(data["data"])
+            execute_started_at = time.perf_counter()
+            if embedding_msg.queue_enqueued_at > 0:
+                queue_wait_ms = max((time.time() - embedding_msg.queue_enqueued_at) * 1000.0, 0.0)
             inserted_data = embedding_msg.context_data
             account_id = inserted_data.get("account_id", "default")
             context_user = inserted_data.get("user") or {}
@@ -677,6 +683,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 except CircuitBreakerOpen:
                     self._log_breaker_open_reenqueue_summary()
                     if self._vikingdb.has_queue_manager:
+                        execute_status = "requeued"
                         wait = self._circuit_breaker.retry_after
                         if wait > 0:
                             await asyncio.sleep(wait)
@@ -690,6 +697,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         )
                         return ProcessResult.requeued()
                     # No queue manager — cannot re-enqueue, drop with error
+                    execute_status = "error"
                     error_msg = self._embedding_error_msg(
                         embedding_msg,
                         "Circuit breaker open and no queue manager",
@@ -742,12 +750,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             pass
 
                         if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
+                            execute_status = "error"
                             logger.error(error_msg)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                             request_failed_message = error_msg
                             return ProcessResult.failed(error_msg)
 
                         if error_class == ERROR_CLASS_PERMANENT:
+                            execute_status = "error"
                             logger.critical(error_msg)
                             self._circuit_breaker.record_failure(embed_err)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
@@ -755,6 +765,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             return ProcessResult.failed(error_msg)
 
                         if error_class == ERROR_CLASS_AUTH:
+                            execute_status = "error"
                             # Bad/expired credential: retrying cannot succeed. Fail
                             # terminally instead of re-enqueueing, which would cycle
                             # forever and hold this resource's tree lock and its
@@ -768,6 +779,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                         # Transient or unknown — re-enqueue for retry
                         logger.warning(error_msg)
+                        execute_status = "requeued"
                         self._circuit_breaker.record_failure(embed_err)
                         if self._vikingdb.has_queue_manager:
                             try:
@@ -793,6 +805,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                                 )
 
                         self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                        execute_status = "error"
                         request_failed_message = error_msg
                         return ProcessResult.failed(error_msg)
 
@@ -801,6 +814,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         inserted_data["vector"] = result.dense_vector
                         # Validate vector dimension
                         if len(result.dense_vector) != self._vector_dim:
+                            execute_status = "error"
                             error_msg = self._embedding_error_msg(
                                 embedding_msg,
                                 "Dense vector dimension mismatch: "
@@ -830,6 +844,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     except Exception:
                         pass
                     self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                    execute_status = "error"
                     request_failed_message = error_msg
                     return ProcessResult.failed(error_msg)
 
@@ -880,6 +895,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                     traceback.print_exc()
                     self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                    execute_status = "error"
                     request_failed_message = error_msg
                     return ProcessResult.failed(error_msg)
                 except Exception as db_err:
@@ -894,6 +910,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     )
                     logger.error(error_msg)
                     self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                    execute_status = "error"
                     request_failed_message = error_msg
                     return ProcessResult.failed(error_msg)
 
@@ -916,9 +933,33 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             traceback.print_exc()
             if embedding_msg is not None:
                 self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                execute_status = "error"
                 request_failed_message = error_msg
             return ProcessResult.failed(error_msg)
         finally:
+            if embedding_msg is not None and execute_started_at is not None:
+                tracker = get_request_wait_tracker()
+                record_timing = getattr(tracker, "record_embedding_timing", None)
+                if callable(record_timing):
+                    record_timing(
+                        embedding_msg.telemetry_id,
+                        queue_wait_ms=queue_wait_ms,
+                        execute_ms=(time.perf_counter() - execute_started_at) * 1000.0,
+                    )
+                from openviking.metrics.datasources.resource import ResourceIngestionEventDataSource
+
+                ResourceIngestionEventDataSource.record_stage(
+                    stage="embedding_queue_wait",
+                    status=execute_status,
+                    duration_seconds=queue_wait_ms / 1000.0,
+                    account_id=embedding_msg.context_data.get("account_id"),
+                )
+                ResourceIngestionEventDataSource.record_stage(
+                    stage="embedding_execute",
+                    status=execute_status,
+                    duration_seconds=(time.perf_counter() - execute_started_at),
+                    account_id=embedding_msg.context_data.get("account_id"),
+                )
             if embedding_msg is not None and request_failed_message is not None:
                 self._record_request_failure(embedding_msg, request_failed_message)
 

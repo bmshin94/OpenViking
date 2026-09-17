@@ -766,22 +766,24 @@ class ResourceService:
                 internal_kwargs["_feishu_checkpoint"] = (saved, save_response)
             prepared_resource = None
             if msg.staged_source is not None:
-                prepared_resource = await materialize_source(
-                    StagedSource.from_dict(msg.staged_source),
-                    viking_fs=self._viking_fs,
-                    ctx=ctx,
-                )
+                with get_current_telemetry().measure("resource.source_prepare"):
+                    prepared_resource = await materialize_source(
+                        StagedSource.from_dict(msg.staged_source),
+                        viking_fs=self._viking_fs,
+                        ctx=ctx,
+                    )
             elif msg.shared_source is not None:
                 from openviking.resource.shared_source import (
                     SharedSource,
                     materialize_shared_source,
                 )
 
-                prepared_resource = await materialize_shared_source(
-                    SharedSource.from_dict(msg.shared_source),
-                    viking_fs=self._viking_fs,
-                    ctx=ctx,
-                )
+                with get_current_telemetry().measure("resource.source_prepare"):
+                    prepared_resource = await materialize_shared_source(
+                        SharedSource.from_dict(msg.shared_source),
+                        viking_fs=self._viking_fs,
+                        ctx=ctx,
+                    )
             if msg.defer_target_resolution:
                 from openviking_cli.utils.uri import VikingURI
 
@@ -1978,7 +1980,6 @@ class ResourceService:
         mode = normalize_parse_mode(parse_mode)
         if mode is ParseMode.NO_SPLIT:
             kwargs["parse_mode"] = mode.value
-        request_start = time.perf_counter()
         telemetry = get_current_telemetry()
         telemetry_id = telemetry.telemetry_id
         register_telemetry(telemetry)
@@ -2151,10 +2152,6 @@ class ResourceService:
         finally:
             if prepared_resource is not None:
                 prepared_resource.cleanup()
-            telemetry.set(
-                "resource.request.duration_ms",
-                round((time.perf_counter() - request_start) * 1000, 3),
-            )
             if not telemetry_id or (defer_post_processing and not job_enqueued):
                 unregister_telemetry(telemetry_id)
             if deferred_lock is not None:

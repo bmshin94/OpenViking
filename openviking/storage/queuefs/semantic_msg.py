@@ -49,6 +49,7 @@ class SemanticMsg:
     context_type: str  # resource, memory, skill, session
     status: str = "pending"  # pending/processing/completed
     timestamp: int = field(default_factory=lambda: int(datetime.now().timestamp()))
+    queue_enqueued_at: float = 0.0
     recursive: bool = True  # Whether to recursively process subdirectories
     account_id: str = "default"
     user_id: str = "default"
@@ -114,9 +115,11 @@ class SemanticMsg:
         artifact_files: Optional[List[str]] = None,
         file_abstracts: Optional[Dict[str, str]] = None,
         plan: SemanticPlan | Dict[str, Any] | None = None,
+        queue_enqueued_at: float = 0.0,
     ):
         self.id = str(uuid4())
         self.timestamp = int(datetime.now().timestamp())
+        self.queue_enqueued_at = max(float(queue_enqueued_at or 0.0), 0.0)
         self.uri = uri
         self.context_type = context_type
         self.recursive = recursive
@@ -222,6 +225,7 @@ class SemanticMsg:
                 data.get("file_abstracts") if isinstance(data.get("file_abstracts"), dict) else None
             ),
             plan=data.get("plan") if isinstance(data.get("plan"), dict) else None,
+            queue_enqueued_at=data.get("queue_enqueued_at", 0.0),
         )
         if "id" in data and data["id"]:
             obj.id = data["id"]

@@ -13,7 +13,7 @@ from openviking.storage.resource_diff import (
     prepare_artifact_inventory,
     read_target_file_snapshot,
 )
-from openviking.storage.resource_rnfv import NewEntry, TargetFile
+from openviking.storage.resource_rnfv import FormalEntry, NewEntry
 
 
 class _Ctx:
@@ -106,7 +106,7 @@ class _FakeVikingDB:
 
 
 @pytest.mark.asyncio
-class TestReadTargetFileSnapshot:
+class TestReadFormalTreeSnapshot:
     async def test_lists_business_files_with_unlimited_scan(self) -> None:
         vfs = _FakeVikingFS(
             [
@@ -270,7 +270,7 @@ async def test_build_rnfv_snapshot_starts_new_formal_and_vector_reads_concurrent
     async def read_formal(*args, **kwargs):
         started.add("formal")
         await release.wait()
-        return {"a.py": TargetFile()}, True
+        return {"a.py": FormalEntry()}, True
 
     async def read_vectors(*args, **kwargs):
         started.add("vectors")

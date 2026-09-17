@@ -288,14 +288,27 @@ class AddResourceProcessor(DequeueHandlerBase):
                     telemetry_id=telemetry_id,
                     root_uri=result.get("root_uri"),
                 )
+                telemetry.set("resource.total.duration_ms", telemetry.elapsed_ms())
 
                 # Extract token usage summary from telemetry and inject into result
                 _snapshot = telemetry.finish()
                 if _snapshot is not None:
+                    result["telemetry"] = _snapshot.to_dict(include_summary=True)
                     _tokens = _snapshot.summary.get("tokens", {})
                     if _tokens:
                         result.setdefault("usage", {})
                         result["usage"]["tokens"] = _tokens
+                    resource_summary = _snapshot.summary.get("resource", {})
+                    queue_summary = _snapshot.summary.get("queue", {})
+                    logger.info(
+                        "[AddResourceCompleted] task_id=%s root=%s total_ms=%s "
+                        "semantic=%s embedding=%s",
+                        msg.task_id,
+                        result.get("root_uri"),
+                        (resource_summary.get("total") or {}).get("duration_ms"),
+                        queue_summary.get("semantic", {}),
+                        queue_summary.get("embedding", {}),
+                    )
 
                 await self._resource_service._link_resource_reason_memory(
                     result=result,
