@@ -21,6 +21,7 @@ from openviking.storage.queuefs.named_queue import DequeueHandlerBase, NamedQueu
 from openviking.storage.queuefs.process_result import ProcessOutcome, ProcessResult
 from openviking.storage.queuefs.queue_middleware import QueueMiddleware
 from openviking.storage.queuefs.session_commit_processor import SessionCommitProcessor
+from openviking.utils.log_correlation import log_correlation
 
 
 @pytest.fixture
@@ -226,16 +227,21 @@ async def test_process_result_tracks_children_and_errors(tracked_queue):
     queue, index, transport, _, _ = tracked_queue
     message = await enqueue_task(queue, transport)
     contexts = []
+    correlations = []
 
     class Handler(DequeueHandlerBase):
         async def on_dequeue(self, data):
             contexts.append(get_task_context())
+            correlations.append(log_correlation(telemetry_id="tm-1", message_id="semantic-1"))
             await queue.enqueue({"child": True})
             return ProcessResult.failed("failed work")
 
     queue.set_dequeue_handler(Handler())
     assert (await queue.process_dequeued(message)).outcome is ProcessOutcome.FAILED
     assert contexts[0].task_id == "task-1"
+    assert correlations == [
+        "task_id=task-1 telemetry_id=tm-1 message_id=semantic-1"
+    ]
     assert get_task_context() is None
     assert index.failure("task-1") == "failed work"
     child_payload = next(

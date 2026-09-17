@@ -3,7 +3,7 @@
 """Tests that the file md5 computed at apply time reaches the vector record.
 
 Local incremental import computes each changed file's md5 while uploading, then
-threads it through SemanticMsg.file_md5s -> DAG -> vectorize_file so the vector
+threads it through SemanticMsg.file_md5s -> tree executor -> vectorize_file so the vector
 record carries the fresh fingerprint. Without this a just-changed file's stored
 md5 stays stale and the next no-op falls back to byte comparison.
 """

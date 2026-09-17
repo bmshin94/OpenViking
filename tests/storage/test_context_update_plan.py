@@ -4,7 +4,7 @@
 import asyncio
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -1408,7 +1408,7 @@ async def test_content_executor_uploads_files_with_bounded_concurrency():
             finally:
                 active -= 1
 
-        async def delete_file(self, path):
+        async def delete_path(self, path, *, is_dir):
             return None
 
         async def mkdir(self, path):
@@ -1436,6 +1436,51 @@ async def test_content_executor_uploads_files_with_bounded_concurrency():
 
     assert peak == 3
     assert created.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_content_executor_logs_failed_action_with_correlation(monkeypatch):
+    import openviking.storage.context_update_plan as plan_module
+    from openviking.service.task_work_index import bind_task_context
+    from openviking.storage.context_update_plan import (
+        ContentTreeAction,
+        execute_content_tree_actions,
+    )
+    from openviking.telemetry import OperationTelemetry, bind_telemetry
+
+    class Target:
+        async def delete_path(self, path, *, is_dir):
+            raise OSError("delete failed")
+
+    action = ContentTreeAction("delete", "old.md", old_kind="file")
+    telemetry = OperationTelemetry("add_resource_job", enabled=True)
+    log_exception = MagicMock()
+    monkeypatch.setattr(plan_module.logger, "exception", log_exception)
+
+    with (
+        bind_task_context("task-1", "acct", "user"),
+        bind_telemetry(telemetry),
+        pytest.raises(OSError, match="delete failed"),
+    ):
+        await execute_content_tree_actions(
+            (action,),
+            store=object(),
+            artifact_ref=object(),
+            target=Target(),
+        )
+
+    message, correlation, operation, relative_path, old_kind, new_kind = (
+        log_exception.call_args.args
+    )
+    assert "[ContentTreeActionFailed]" in message
+    assert correlation == f"task_id=task-1 telemetry_id={telemetry.telemetry_id}"
+    assert (operation, relative_path, old_kind, new_kind) == (
+        "delete",
+        "old.md",
+        "file",
+        "-",
+    )
+    assert log_exception.call_args.kwargs == {}
 
 
 @pytest.mark.asyncio
@@ -1540,7 +1585,7 @@ def test_semantic_message_roundtrip_uses_explicit_plan():
 
 
 @pytest.mark.asyncio
-async def test_v3_dag_reuses_explicit_node_without_listing_its_subtree(monkeypatch):
+async def test_v3_tree_reuses_explicit_node_without_listing_its_subtree(monkeypatch):
     from openviking.server.identity import RequestContext, Role
     from openviking.storage.context_update_plan import (
         IndexSlot,
@@ -1548,7 +1593,7 @@ async def test_v3_dag_reuses_explicit_node_without_listing_its_subtree(monkeypat
         SemanticTreeEntry,
         SemanticTreeSnapshot,
     )
-    from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
+    from openviking.storage.queuefs.semantic_executor import SemanticTreeExecutor
     from openviking_cli.session.user_id import UserIdentifier
 
     root = "viking://resources/repo"
@@ -1566,7 +1611,7 @@ async def test_v3_dag_reuses_explicit_node_without_listing_its_subtree(monkeypat
 
     fs = FS()
     fs._async_agfs = fs
-    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fs)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_executor.get_viking_fs", lambda: fs)
     processor = AsyncMock()
     plan = SemanticPlan(
         root,
@@ -1583,7 +1628,7 @@ async def test_v3_dag_reuses_explicit_node_without_listing_its_subtree(monkeypat
             )
         ),
     )
-    executor = SemanticDagExecutor(
+    executor = SemanticTreeExecutor(
         processor=processor,
         context_type="resource",
         max_concurrent_llm=1,
@@ -1605,7 +1650,7 @@ async def test_directory_index_slots_choose_exact_levels(monkeypatch):
         SemanticTreeEntry,
         SemanticTreeSnapshot,
     )
-    from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
+    from openviking.storage.queuefs.semantic_executor import SemanticTreeExecutor
     from openviking_cli.session.user_id import UserIdentifier
 
     root = "viking://resources/repo"
@@ -1614,9 +1659,9 @@ async def test_directory_index_slots_choose_exact_levels(monkeypatch):
         _uri_to_path=lambda uri, ctx=None: uri,
     )
     fs._async_agfs = fs
-    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fs)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_executor.get_viking_fs", lambda: fs)
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        "openviking.storage.queuefs.semantic_executor.get_openviking_config",
         lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
     )
 
@@ -1647,7 +1692,7 @@ async def test_directory_index_slots_choose_exact_levels(monkeypatch):
             )
         ),
     )
-    executor = SemanticDagExecutor(
+    executor = SemanticTreeExecutor(
         processor=processor,
         context_type="resource",
         max_concurrent_llm=1,
@@ -1675,15 +1720,15 @@ async def test_directory_output_unchanged_still_applies_planned_scalar_fields(mo
         SemanticTreeEntry,
         SemanticTreeSnapshot,
     )
-    from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
+    from openviking.storage.queuefs.semantic_executor import SemanticTreeExecutor
     from openviking_cli.session.user_id import UserIdentifier
 
     root = "viking://resources/repo"
     fs = SimpleNamespace(_async_agfs=None, _uri_to_path=lambda uri, ctx=None: uri)
     fs._async_agfs = fs
-    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fs)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_executor.get_viking_fs", lambda: fs)
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        "openviking.storage.queuefs.semantic_executor.get_openviking_config",
         lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
     )
 
@@ -1729,7 +1774,7 @@ async def test_directory_output_unchanged_still_applies_planned_scalar_fields(mo
             )
         ),
     )
-    executor = SemanticDagExecutor(
+    executor = SemanticTreeExecutor(
         processor=processor,
         context_type="resource",
         max_concurrent_llm=1,
@@ -1763,7 +1808,7 @@ async def test_code_summary_unchanged_updates_md5_without_reembedding(monkeypatc
         SemanticTreeEntry,
         SemanticTreeSnapshot,
     )
-    from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
+    from openviking.storage.queuefs.semantic_executor import SemanticTreeExecutor
     from openviking_cli.session.user_id import UserIdentifier
 
     root = "viking://resources/repo"
@@ -1773,9 +1818,9 @@ async def test_code_summary_unchanged_updates_md5_without_reembedding(monkeypatc
         read_file_bytes=AsyncMock(return_value=b"changed body"),
     )
     fs._async_agfs = fs
-    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fs)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_executor.get_viking_fs", lambda: fs)
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        "openviking.storage.queuefs.semantic_executor.get_openviking_config",
         lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
     )
 
@@ -1824,7 +1869,7 @@ async def test_code_summary_unchanged_updates_md5_without_reembedding(monkeypatc
         ),
         file_vector_source="summary_when_available",
     )
-    executor = SemanticDagExecutor(
+    executor = SemanticTreeExecutor(
         processor=processor,
         context_type="resource",
         max_concurrent_llm=1,
@@ -2077,7 +2122,7 @@ async def test_semantic_processor_runs_only_plan_execution_roots(monkeypatch):
     fs = SimpleNamespace(exists=AsyncMock(return_value=True))
     monkeypatch.setattr("openviking.storage.queuefs.semantic_processor.get_viking_fs", lambda: fs)
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.SemanticDagExecutor", Executor
+        "openviking.storage.queuefs.semantic_processor.SemanticTreeExecutor", Executor
     )
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",

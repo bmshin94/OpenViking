@@ -28,11 +28,11 @@ def _consume_embedding_request_stats(telemetry_id: str):
         return None
 
 
-def _consume_semantic_dag_stats(telemetry_id: str, root_uri: str | None):
+def _consume_semantic_tree_stats(telemetry_id: str, root_uri: str | None):
     try:
         from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 
-        return SemanticProcessor.consume_dag_stats(telemetry_id=telemetry_id, uri=root_uri)
+        return SemanticProcessor.consume_tree_stats(telemetry_id=telemetry_id, uri=root_uri)
     except Exception:
         return None
 
@@ -66,7 +66,7 @@ def record_resource_queue_metrics(
     telemetry_id: str,
     root_uri: str | None,
 ) -> None:
-    """Apply queue and DAG metrics to a resource operation collector."""
+    """Apply queue and semantic-tree metrics to a resource operation collector."""
     if not telemetry.enabled:
         return
 
@@ -85,12 +85,12 @@ def record_resource_queue_metrics(
     telemetry.set("queue.embedding.queue_wait.duration_ms", timing["embedding"]["queue_wait_ms"])
     telemetry.set("queue.embedding.execute.duration_ms", timing["embedding"]["execute_ms"])
 
-    dag_stats = _consume_semantic_dag_stats(telemetry_id, root_uri)
-    if dag_stats is not None:
-        telemetry.set("semantic_nodes.total", dag_stats.total_nodes)
-        telemetry.set("semantic_nodes.done", dag_stats.done_nodes)
-        telemetry.set("semantic_nodes.pending", dag_stats.pending_nodes)
-        telemetry.set("semantic_nodes.running", dag_stats.in_progress_nodes)
+    tree_stats = _consume_semantic_tree_stats(telemetry_id, root_uri)
+    if tree_stats is not None:
+        telemetry.set("semantic_nodes.total", tree_stats.total_nodes)
+        telemetry.set("semantic_nodes.done", tree_stats.done_nodes)
+        telemetry.set("semantic_nodes.pending", tree_stats.pending_nodes)
+        telemetry.set("semantic_nodes.running", tree_stats.in_progress_nodes)
 
 __all__ = [
     "build_queue_status_payload",

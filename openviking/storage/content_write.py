@@ -1606,7 +1606,7 @@ class ContentWriteCoordinator:
                 if anchor_to_parent:
                     # Content writes anchor the semantic refresh at the written file's
                     # direct parent directory, so the changed file is a direct child of
-                    # the DAG run root: its own L2 vector and the parent's L0/L1 are
+                    # the semantic-tree root: its own L2 vector and the parent's L0/L1 are
                     # (re)generated from a single-directory run, while ancestor summaries
                     # refresh via the existing parent bubble. Collapsing to the project
                     # root instead would force the run to traverse the whole project

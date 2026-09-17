@@ -47,7 +47,7 @@ from openviking.storage.acl import CreatorAclGrant
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
-from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
+from openviking.storage.queuefs.semantic_executor import SemanticTreeExecutor, SemanticTreeStats
 from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
 from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
@@ -62,6 +62,7 @@ from openviking.utils.circuit_breaker import (
     classify_api_error,
 )
 from openviking.utils.ingest_options import IngestOptions
+from openviking.utils.log_correlation import log_correlation
 from openviking.utils.model_retry import ERROR_CLASS_INPUT_TOO_LARGE, ERROR_CLASS_PERMANENT
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import VikingURI
@@ -105,12 +106,18 @@ class SemanticProcessor(DequeueHandlerBase):
         except Exception as exc:
             logger.warning("Failed to clean local parse artifact: %s", exc)
 
-    _dag_stats_by_telemetry_id: Dict[str, DagStats] = {}
-    _dag_stats_by_uri: Dict[str, DagStats] = {}
-    _dag_stats_order: List[Tuple[str, str]] = []
+    _tree_stats_by_telemetry_id: Dict[str, SemanticTreeStats] = {}
+    _tree_stats_by_uri: Dict[str, SemanticTreeStats] = {}
+    _tree_stats_order: List[Tuple[str, str]] = []
     _request_stats_by_telemetry_id: Dict[str, RequestQueueStats] = {}
     _request_stats_order: List[str] = []
     _max_cached_stats = 256
+
+    @staticmethod
+    def _message_log_context(msg: Optional[SemanticMsg]) -> str:
+        if msg is None:
+            return log_correlation()
+        return log_correlation(telemetry_id=msg.telemetry_id, message_id=msg.id)
 
     def __init__(self, max_concurrent_llm: int = 32):
         """
@@ -124,32 +131,32 @@ class SemanticProcessor(DequeueHandlerBase):
         self._circuit_breaker = CircuitBreaker()
 
     @classmethod
-    def _cache_dag_stats(cls, telemetry_id: str, uri: str, stats: DagStats) -> None:
+    def _cache_tree_stats(cls, telemetry_id: str, uri: str, stats: SemanticTreeStats) -> None:
         with cls._stats_lock:
             if telemetry_id:
-                cls._dag_stats_by_telemetry_id[telemetry_id] = stats
-            cls._dag_stats_by_uri[uri] = stats
-            cls._dag_stats_order.append((telemetry_id, uri))
-            if len(cls._dag_stats_order) > cls._max_cached_stats:
-                old_telemetry_id, old_uri = cls._dag_stats_order.pop(0)
+                cls._tree_stats_by_telemetry_id[telemetry_id] = stats
+            cls._tree_stats_by_uri[uri] = stats
+            cls._tree_stats_order.append((telemetry_id, uri))
+            if len(cls._tree_stats_order) > cls._max_cached_stats:
+                old_telemetry_id, old_uri = cls._tree_stats_order.pop(0)
                 if old_telemetry_id:
-                    cls._dag_stats_by_telemetry_id.pop(old_telemetry_id, None)
-                cls._dag_stats_by_uri.pop(old_uri, None)
+                    cls._tree_stats_by_telemetry_id.pop(old_telemetry_id, None)
+                cls._tree_stats_by_uri.pop(old_uri, None)
 
     @classmethod
-    def consume_dag_stats(
+    def consume_tree_stats(
         cls,
         telemetry_id: str = "",
         uri: Optional[str] = None,
-    ) -> Optional[DagStats]:
+    ) -> Optional[SemanticTreeStats]:
         with cls._stats_lock:
-            if telemetry_id and telemetry_id in cls._dag_stats_by_telemetry_id:
-                stats = cls._dag_stats_by_telemetry_id.pop(telemetry_id, None)
+            if telemetry_id and telemetry_id in cls._tree_stats_by_telemetry_id:
+                stats = cls._tree_stats_by_telemetry_id.pop(telemetry_id, None)
                 if uri:
-                    cls._dag_stats_by_uri.pop(uri, None)
+                    cls._tree_stats_by_uri.pop(uri, None)
                 return stats
-            if uri and uri in cls._dag_stats_by_uri:
-                return cls._dag_stats_by_uri.pop(uri, None)
+            if uri and uri in cls._tree_stats_by_uri:
+                return cls._tree_stats_by_uri.pop(uri, None)
         return None
 
     @classmethod
@@ -239,9 +246,17 @@ class SemanticProcessor(DequeueHandlerBase):
         if queue_manager is not None:
             semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC)
             await semantic_queue.enqueue(msg)
-            logger.info(f"Re-enqueued semantic message: {msg.uri}")
+            logger.info(
+                "Re-enqueued semantic message: %s uri=%s",
+                self._message_log_context(msg),
+                msg.uri,
+            )
         else:
-            logger.warning(f"No queue manager available, cannot re-enqueue: {msg.uri}")
+            logger.warning(
+                "No queue manager available, cannot re-enqueue: %s uri=%s",
+                self._message_log_context(msg),
+                msg.uri,
+            )
 
     async def _requeue_semantic_msg_after_error(
         self,
@@ -253,7 +268,11 @@ class SemanticProcessor(DequeueHandlerBase):
             self._merge_request_stats(msg.telemetry_id, requeue_count=1)
             get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
         except Exception as requeue_err:
-            logger.error(f"Failed to re-enqueue semantic message: {requeue_err}")
+            logger.error(
+                "Failed to re-enqueue semantic message: %s error=%s",
+                self._message_log_context(msg),
+                requeue_err,
+            )
             self._merge_request_stats(msg.telemetry_id, error_count=1)
             get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, str(error))
             await self._cleanup_local_artifact(msg)
@@ -427,7 +446,10 @@ class SemanticProcessor(DequeueHandlerBase):
                 try:
                     current_ctx = self._ctx_from_semantic_msg(msg)
                     logger.info(
-                        f"Processing semantic generation for: {msg.uri} (recursive={msg.recursive})"
+                        "Processing semantic generation: %s uri=%s recursive=%s",
+                        log_correlation(telemetry_id=msg.telemetry_id, message_id=msg.id),
+                        msg.uri,
+                        msg.recursive,
                     )
 
                     logger.debug("Processing semantic message id=%s uri=%s", msg.id, msg.uri)
@@ -457,7 +479,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                     "semantic message context_type must match semantic plan"
                                 )
                             for run_uri in msg.plan.execution_root_uris():
-                                executor = SemanticDagExecutor(
+                                executor = SemanticTreeExecutor(
                                     processor=self,
                                     context_type=msg.context_type,
                                     max_concurrent_llm=self.max_concurrent_llm,
@@ -467,7 +489,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                     semantic_plan=msg.plan,
                                 )
                                 await executor.run(run_uri)
-                                self._cache_dag_stats(
+                                self._cache_tree_stats(
                                     msg.telemetry_id, run_uri, executor.get_stats()
                                 )
                                 if not executor.stale and msg.plan.propagation.enabled:
@@ -493,8 +515,11 @@ class SemanticProcessor(DequeueHandlerBase):
                                 for slot in entry.index_slots
                             )
                             logger.info(
-                                "[SemanticPlanExecution] root=%s execution_roots=%d "
+                                "[SemanticPlanExecution] %s root=%s execution_roots=%d "
                                 "semantic_entries=%d actions=%s planned_vector_upserts=%d",
+                                log_correlation(
+                                    telemetry_id=msg.telemetry_id, message_id=msg.id
+                                ),
                                 msg.plan.root_uri,
                                 len(msg.plan.execution_root_uris()),
                                 len(entries),
@@ -559,7 +584,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                     f"Using direct incremental semantic update for: {msg.uri}"
                                 )
 
-                            executor = SemanticDagExecutor(
+                            executor = SemanticTreeExecutor(
                                 processor=self,
                                 context_type=msg.context_type,
                                 max_concurrent_llm=self.max_concurrent_llm,
@@ -584,7 +609,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                 file_abstracts=msg.file_abstracts,
                             )
                             await executor.run(run_uri)
-                            self._cache_dag_stats(
+                            self._cache_tree_stats(
                                 msg.telemetry_id,
                                 run_uri,
                                 executor.get_stats(),
@@ -606,7 +631,11 @@ class SemanticProcessor(DequeueHandlerBase):
                         await semantic_lock.close()
                     get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
                     self._merge_request_stats(msg.telemetry_id, processed=1)
-                    logger.info(f"Completed semantic generation for: {msg.uri}")
+                    logger.info(
+                        "Completed semantic generation: %s uri=%s",
+                        log_correlation(telemetry_id=msg.telemetry_id, message_id=msg.id),
+                        msg.uri,
+                    )
                     self._circuit_breaker.record_success()
                     await self._cleanup_local_artifact(msg)
                     return ProcessResult.success()
@@ -618,7 +647,8 @@ class SemanticProcessor(DequeueHandlerBase):
                 execute_status = "requeued"
                 logger.warning(
                     "Lock error processing semantic message, re-enqueueing without "
-                    "tripping API circuit breaker: %s",
+                    "tripping API circuit breaker: %s error=%s",
+                    self._message_log_context(msg),
                     e,
                     exc_info=True,
                 )
@@ -630,7 +660,9 @@ class SemanticProcessor(DequeueHandlerBase):
             if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
                 execute_status = "error"
                 logger.error(
-                    f"Input too large processing semantic message, dropping: {e}",
+                    "Input too large processing semantic message, dropping: %s error=%s",
+                    self._message_log_context(msg),
+                    e,
                     exc_info=True,
                 )
                 if msg is not None:
@@ -644,7 +676,9 @@ class SemanticProcessor(DequeueHandlerBase):
             elif error_class == ERROR_CLASS_PERMANENT:
                 execute_status = "error"
                 logger.critical(
-                    f"Permanent API error processing semantic message, dropping: {e}",
+                    "Permanent API error processing semantic message, dropping: %s error=%s",
+                    self._message_log_context(msg),
+                    e,
                     exc_info=True,
                 )
                 self._circuit_breaker.record_failure(e)
@@ -660,7 +694,9 @@ class SemanticProcessor(DequeueHandlerBase):
                 # Transient or unknown — re-enqueue for retry
                 execute_status = "requeued"
                 logger.warning(
-                    f"Transient API error processing semantic message, re-enqueueing: {e}",
+                    "Transient API error processing semantic message, re-enqueueing: %s error=%s",
+                    self._message_log_context(msg),
+                    e,
                     exc_info=True,
                 )
                 self._circuit_breaker.record_failure(e)
@@ -716,8 +752,8 @@ class SemanticProcessor(DequeueHandlerBase):
         await self._cleanup_local_artifact(msg)
         return ProcessResult.cancelled()
 
-    def get_dag_stats(self) -> Optional["DagStats"]:
-        return SemanticDagExecutor.get_active_stats()
+    def get_tree_stats(self) -> Optional["SemanticTreeStats"]:
+        return SemanticTreeExecutor.get_active_stats()
 
     async def _process_memory_directory(
         self,

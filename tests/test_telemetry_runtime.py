@@ -21,7 +21,7 @@ from openviking.observability.context import (
     reset_root_observability_context,
 )
 from openviking.storage.collection_schemas import TextEmbeddingHandler
-from openviking.storage.queuefs.semantic_dag import DagStats
+from openviking.storage.queuefs.semantic_executor import SemanticTreeStats
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.telemetry import (
@@ -737,7 +737,7 @@ async def test_semantic_processor_binds_registered_operation_telemetry(monkeypat
         async def ls(self, uri, ctx=None):
             return []
 
-    class _FakeDagExecutor:
+    class _FakeTreeExecutor:
         def __init__(self, **kwargs):
             pass
 
@@ -746,15 +746,15 @@ async def test_semantic_processor_binds_registered_operation_telemetry(monkeypat
             get_current_telemetry().record_token_usage("llm", 11, 7)
 
         def get_stats(self):
-            return DagStats()
+            return SemanticTreeStats()
 
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_processor.get_viking_fs",
         lambda: FakeVikingFS(),
     )
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.SemanticDagExecutor",
-        lambda **kwargs: _FakeDagExecutor(**kwargs),
+        "openviking.storage.queuefs.semantic_processor.SemanticTreeExecutor",
+        lambda **kwargs: _FakeTreeExecutor(**kwargs),
     )
 
     try:
@@ -788,7 +788,7 @@ async def test_semantic_processor_binds_metric_account_context(monkeypatch):
         async def ls(self, uri, ctx=None):
             return []
 
-    class _FakeDagExecutor:
+    class _FakeTreeExecutor:
         def __init__(self, **kwargs):
             pass
 
@@ -799,15 +799,15 @@ async def test_semantic_processor_binds_metric_account_context(monkeypatch):
             assert root_context.account_id == "acct-semantic"
 
         def get_stats(self):
-            return DagStats()
+            return SemanticTreeStats()
 
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_processor.get_viking_fs",
         lambda: FakeVikingFS(),
     )
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.SemanticDagExecutor",
-        lambda **kwargs: _FakeDagExecutor(**kwargs),
+        "openviking.storage.queuefs.semantic_processor.SemanticTreeExecutor",
+        lambda **kwargs: _FakeTreeExecutor(**kwargs),
     )
 
     await processor.on_dequeue(

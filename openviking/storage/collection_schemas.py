@@ -10,6 +10,7 @@ similar to how init_viking_fs encapsulates VikingFS initialization.
 import asyncio
 import hashlib
 import json
+import logging
 import threading
 import time
 from contextlib import nullcontext
@@ -41,6 +42,7 @@ from openviking.utils.circuit_breaker import (
     CircuitBreakerOpen,
     classify_api_error,
 )
+from openviking.utils.log_correlation import log_correlation
 from openviking.utils.model_retry import (
     ERROR_CLASS_AUTH,
     ERROR_CLASS_INPUT_TOO_LARGE,
@@ -549,12 +551,22 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
     @staticmethod
     def _embedding_msg_log_context(embedding_msg: Optional[EmbeddingMsg]) -> str:
-        """Return the URI allowed in embedding logs."""
+        """Return the URI-safe context retained in public error messages."""
         if embedding_msg is None:
             return "uri=<unknown>"
 
         context_data = embedding_msg.context_data or {}
         return f"uri={context_data.get('uri') or '<unknown>'}"
+
+    @classmethod
+    def _embedding_delivery_log_context(cls, embedding_msg: Optional[EmbeddingMsg]) -> str:
+        """Return request/message IDs plus the safe embedding URI for logs."""
+        if embedding_msg is None:
+            return f"{log_correlation()} {cls._embedding_msg_log_context(None)}"
+        return (
+            f"{log_correlation(telemetry_id=embedding_msg.telemetry_id, message_id=embedding_msg.id)} "
+            f"{cls._embedding_msg_log_context(embedding_msg)}"
+        )
 
     @classmethod
     def _embedding_error_msg(
@@ -563,6 +575,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         message: str,
     ) -> str:
         return f"{message} ({cls._embedding_msg_log_context(embedding_msg)})"
+
+    @classmethod
+    def _log_embedding_error(
+        cls, level: int, message: str, embedding_msg: Optional[EmbeddingMsg]
+    ) -> None:
+        """Log an internal correlation suffix without changing public errors."""
+        logger.log(level, "%s [%s]", message, cls._embedding_delivery_log_context(embedding_msg))
 
     @staticmethod
     async def _materialize_content(
@@ -646,6 +665,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             if embedding_msg.queue_enqueued_at > 0:
                 queue_wait_ms = max((time.time() - embedding_msg.queue_enqueued_at) * 1000.0, 0.0)
             inserted_data = embedding_msg.context_data
+            logger.debug(
+                "Processing embedding message: %s operation=%s",
+                self._embedding_delivery_log_context(embedding_msg),
+                embedding_msg.operation.value,
+            )
             account_id = inserted_data.get("account_id", "default")
             context_user = inserted_data.get("user") or {}
             user_id = context_user.get("user_id") or inserted_data.get("owner_user_id") or "default"
@@ -751,14 +775,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                         if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
                             execute_status = "error"
-                            logger.error(error_msg)
+                            self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                             request_failed_message = error_msg
                             return ProcessResult.failed(error_msg)
 
                         if error_class == ERROR_CLASS_PERMANENT:
                             execute_status = "error"
-                            logger.critical(error_msg)
+                            self._log_embedding_error(logging.CRITICAL, error_msg, embedding_msg)
                             self._circuit_breaker.record_failure(embed_err)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                             request_failed_message = error_msg
@@ -772,13 +796,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             # add-resource --wait open. Don't trip the breaker: an open
                             # breaker re-enqueues later messages and reintroduces the
                             # same leak. See #2916.
-                            logger.error(error_msg)
+                            self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                             request_failed_message = error_msg
                             return ProcessResult.failed(error_msg)
 
                         # Transient or unknown — re-enqueue for retry
-                        logger.warning(error_msg)
+                        self._log_embedding_error(logging.WARNING, error_msg, embedding_msg)
                         execute_status = "requeued"
                         self._circuit_breaker.record_failure(embed_err)
                         if self._vikingdb.has_queue_manager:
@@ -792,8 +816,8 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                                     embedding_msg.telemetry_id
                                 )
                                 logger.info(
-                                    "Re-enqueued embedding message after transient error "
-                                    f"({self._embedding_msg_log_context(embedding_msg)})"
+                                    "Re-enqueued embedding message after transient error: %s",
+                                    self._embedding_delivery_log_context(embedding_msg),
                                 )
                                 return ProcessResult.requeued()
                             except Exception as requeue_err:
@@ -820,7 +844,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                                 "Dense vector dimension mismatch: "
                                 f"expected {self._vector_dim}, got {len(result.dense_vector)}",
                             )
-                            logger.error(error_msg)
+                            self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                             request_failed_message = error_msg
                             return ProcessResult.failed(error_msg)
@@ -836,7 +860,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         embedding_msg,
                         "Embedder not initialized, skipping vector generation",
                     )
-                    logger.warning(error_msg)
+                    self._log_embedding_error(logging.WARNING, error_msg, embedding_msg)
                     try:
                         from openviking.metrics.datasources import EmbeddingEventDataSource
 
@@ -878,7 +902,10 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     )
                     record_id = result
                     if record_id:
-                        logger.debug("Successfully wrote embedding: uri=%s", uri)
+                        logger.debug(
+                            "Successfully wrote embedding: %s",
+                            self._embedding_delivery_log_context(embedding_msg),
+                        )
                 except CollectionNotFoundError as db_err:
                     # During shutdown, queue workers may finish one dequeued item.
                     if self._vikingdb.is_closing:
@@ -890,7 +917,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         embedding_msg,
                         f"Failed to write to vector database: {db_err}",
                     )
-                    logger.error(error_msg)
+                    self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                     import traceback
 
                     traceback.print_exc()
@@ -908,7 +935,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         embedding_msg,
                         f"Failed to write to vector database: {db_err}",
                     )
-                    logger.error(error_msg)
+                    self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                     self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                     execute_status = "error"
                     request_failed_message = error_msg

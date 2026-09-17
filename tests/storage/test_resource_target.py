@@ -29,7 +29,7 @@ class _FakeVikingFS:
         self.files.pop(uri, None)
 
     async def remove_files(self, uri, *, recursive=False, ctx=None, lease_ref=None):
-        self.removed.append(uri)
+        self.removed.append((uri, recursive, lease_ref))
         self.files.pop(uri, None)
 
 
@@ -85,14 +85,36 @@ class TestAgfsResourceTarget:
         with pytest.raises(ValueError):
             await target.write_file("../evil.py", b"x")
 
-    async def test_delete_file_removes_uri(self) -> None:
+    async def test_delete_path_uses_exact_semantics_for_file(self) -> None:
+        lease = {"lease_ref": "root-tree"}
         vfs = _FakeVikingFS(existing={f"{_ROOT}/gone.py": b"x"})
-        target = _target(vfs, _FakeVikingDB())
+        target = AgfsResourceTarget(
+            viking_fs=vfs,
+            vikingdb=_FakeVikingDB(),
+            root_uri=_ROOT,
+            ctx=_Ctx(),
+            lease_ref=lease,
+        )
 
-        await target.delete_file("gone.py")
+        await target.delete_path("gone.py", is_dir=False)
 
-        assert f"{_ROOT}/gone.py" in vfs.removed
+        assert vfs.removed == [(f"{_ROOT}/gone.py", False, lease)]
         assert target._vikingdb.deleted_uris == []
+
+    async def test_delete_path_uses_tree_semantics_for_directory(self) -> None:
+        lease = {"lease_ref": "root-tree"}
+        vfs = _FakeVikingFS()
+        target = AgfsResourceTarget(
+            viking_fs=vfs,
+            vikingdb=_FakeVikingDB(),
+            root_uri=_ROOT,
+            ctx=_Ctx(),
+            lease_ref=lease,
+        )
+
+        await target.delete_path("old-dir", is_dir=True)
+
+        assert vfs.removed == [(f"{_ROOT}/old-dir", True, lease)]
 
     async def test_delete_vector_removes_l2_record(self) -> None:
         vikingdb = _FakeVikingDB()

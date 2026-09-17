@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Semantic DAG executor with event-driven lazy dispatch."""
+"""Semantic tree executor with event-driven lazy dispatch."""
 
 import asyncio
 import re
@@ -45,8 +45,8 @@ _SKIP_FILENAMES = frozenset({"messages.jsonl"})
 
 
 @dataclass
-class DirNode:
-    """Directory node state for DAG execution."""
+class SemanticTreeNode:
+    """Directory node state for bottom-up semantic-tree execution."""
 
     uri: str
     children_dirs: List[str]
@@ -68,7 +68,7 @@ class DirNode:
 
 
 @dataclass
-class DagStats:
+class SemanticTreeStats:
     total_nodes: int = 0
     pending_nodes: int = 0
     in_progress_nodes: int = 0
@@ -76,8 +76,8 @@ class DagStats:
 
 
 @dataclass(frozen=True)
-class DagWork:
-    """A scheduled unit of DAG work."""
+class SemanticTreeWork:
+    """A scheduled unit of semantic-tree work."""
 
     kind: str
     dir_uri: str
@@ -86,27 +86,27 @@ class DagWork:
 
 
 @dataclass(frozen=True)
-class ScheduledDagWork:
-    executor: "SemanticDagExecutor"
-    work: DagWork
+class ScheduledSemanticTreeWork:
+    executor: "SemanticTreeExecutor"
+    work: SemanticTreeWork
 
 
-class SemanticNodeScheduler:
-    """Shared node executor for semantic DAG work in one event loop."""
+class SemanticTreeScheduler:
+    """Shared node executor for semantic tree work in one event loop."""
 
     _idle_timeout = 0.05
 
     def __init__(self, max_workers: int):
         self._max_workers = max(1, max_workers)
-        self._queue: asyncio.Queue[ScheduledDagWork] = asyncio.Queue()
+        self._queue: asyncio.Queue[ScheduledSemanticTreeWork] = asyncio.Queue()
         self._workers: Set[asyncio.Task] = set()
 
     def configure(self, max_workers: int) -> None:
         self._max_workers = max(1, max_workers)
         self._ensure_workers()
 
-    def submit(self, executor: "SemanticDagExecutor", work: DagWork) -> None:
-        self._queue.put_nowait(ScheduledDagWork(executor=executor, work=work))
+    def submit(self, executor: "SemanticTreeExecutor", work: SemanticTreeWork) -> None:
+        self._queue.put_nowait(ScheduledSemanticTreeWork(executor=executor, work=work))
         self._ensure_workers()
 
     def _ensure_workers(self) -> None:
@@ -142,27 +142,27 @@ class SemanticNodeScheduler:
                 self._queue.task_done()
 
 
-_node_schedulers: "WeakKeyDictionary[asyncio.AbstractEventLoop, SemanticNodeScheduler]" = (
+_node_schedulers: "WeakKeyDictionary[asyncio.AbstractEventLoop, SemanticTreeScheduler]" = (
     WeakKeyDictionary()
 )
 
 
-def get_semantic_node_scheduler(max_workers: int) -> SemanticNodeScheduler:
+def get_semantic_tree_scheduler(max_workers: int) -> SemanticTreeScheduler:
     loop = asyncio.get_running_loop()
     scheduler = _node_schedulers.get(loop)
     if scheduler is None:
-        scheduler = SemanticNodeScheduler(max_workers=max_workers)
+        scheduler = SemanticTreeScheduler(max_workers=max_workers)
         _node_schedulers[loop] = scheduler
     else:
         scheduler.configure(max_workers)
     return scheduler
 
 
-class SemanticDagExecutor:
-    """Execute semantic generation with DAG-style, event-driven lazy dispatch."""
+class SemanticTreeExecutor:
+    """Execute a semantic tree with event-driven, bottom-up dispatch."""
 
     _active_lock: ClassVar[threading.Lock] = threading.Lock()
-    _active_executors: ClassVar[Set["SemanticDagExecutor"]] = set()
+    _active_executors: ClassVar[Set["SemanticTreeExecutor"]] = set()
 
     def __init__(
         self,
@@ -247,17 +247,17 @@ class SemanticDagExecutor:
         self._node_concurrency = max(1, max_concurrent_llm)
         self._llm_sem = asyncio.Semaphore(max_concurrent_llm)
         self._viking_fs = get_viking_fs()
-        self._nodes: Dict[str, DirNode] = {}
+        self._nodes: Dict[str, SemanticTreeNode] = {}
         self._parent: Dict[str, Optional[str]] = {}
         self._root_uri: Optional[str] = None
         self._root_done: Optional[asyncio.Event] = None
-        self._scheduler: Optional[SemanticNodeScheduler] = None
+        self._scheduler: Optional[SemanticTreeScheduler] = None
         self._active_scheduled_work = 0
         self._active_work_idle = asyncio.Event()
         self._active_work_idle.set()
         self._closed = False
         self._failure: Optional[Exception] = None
-        self._stats = DagStats()
+        self._stats = SemanticTreeStats()
         self._file_change_status: Dict[str, bool] = {}
         self._dir_change_status: Dict[str, bool] = {}
         self._overview_cache: Dict[str, Dict[str, str]] = {}
@@ -359,10 +359,10 @@ class SemanticDagExecutor:
         return CreatorAclGrant.DIRECT if normalized in self._added_paths else None
 
     async def run(self, root_uri: str) -> None:
-        """Run DAG execution starting from root_uri."""
+        """Execute the semantic subtree rooted at ``root_uri``."""
         self._root_uri = root_uri
         self._root_done = asyncio.Event()
-        self._scheduler = get_semantic_node_scheduler(self._node_concurrency)
+        self._scheduler = get_semantic_tree_scheduler(self._node_concurrency)
         if self._semantic_plan is not None:
             from openviking.storage.context_update_plan import (
                 SemanticAction,
@@ -393,11 +393,11 @@ class SemanticDagExecutor:
             await self._active_work_idle.wait()
             self._unregister_active()
 
-    def _schedule_work(self, work: DagWork) -> None:
+    def _schedule_work(self, work: SemanticTreeWork) -> None:
         if self._closed:
             return
         if self._scheduler is None:
-            self._scheduler = get_semantic_node_scheduler(self._node_concurrency)
+            self._scheduler = get_semantic_tree_scheduler(self._node_concurrency)
         self._scheduler.submit(self, work)
 
     def _start_scheduled_work(self) -> None:
@@ -414,14 +414,14 @@ class SemanticDagExecutor:
             return
         self._stats.total_nodes += 1
         self._stats.pending_nodes += 1
-        self._schedule_work(DagWork(kind="dir", dir_uri=dir_uri, parent_uri=parent_uri))
+        self._schedule_work(SemanticTreeWork(kind="dir", dir_uri=dir_uri, parent_uri=parent_uri))
 
     def _schedule_file(self, parent_uri: str, file_path: str) -> None:
         if self._closed:
             return
         self._stats.total_nodes += 1
         self._stats.pending_nodes += 1
-        self._schedule_work(DagWork(kind="file", dir_uri=parent_uri, file_path=file_path))
+        self._schedule_work(SemanticTreeWork(kind="file", dir_uri=parent_uri, file_path=file_path))
 
     def _mark_node_started(self) -> None:
         self._stats.pending_nodes = max(0, self._stats.pending_nodes - 1)
@@ -459,8 +459,8 @@ class SemanticDagExecutor:
             self._active_executors.discard(self)
 
     @classmethod
-    def get_active_stats(cls) -> DagStats:
-        stats = DagStats()
+    def get_active_stats(cls) -> SemanticTreeStats:
+        stats = SemanticTreeStats()
         with cls._active_lock:
             executors = list(cls._active_executors)
         for executor in executors:
@@ -471,7 +471,7 @@ class SemanticDagExecutor:
             stats.done_nodes += current.done_nodes
         return stats
 
-    async def _run_work(self, work: DagWork) -> None:
+    async def _run_work(self, work: SemanticTreeWork) -> None:
         task_context = (
             bind_task_context(
                 self._task_context.task_id,
@@ -484,7 +484,7 @@ class SemanticDagExecutor:
         with bind_telemetry(self._telemetry), task_context:
             await self._run_work_bound(work)
 
-    async def _run_work_bound(self, work: DagWork) -> None:
+    async def _run_work_bound(self, work: SemanticTreeWork) -> None:
         self._mark_node_started()
 
         if work.kind == "dir":
@@ -510,7 +510,7 @@ class SemanticDagExecutor:
             return
 
         self._mark_node_done()
-        logger.warning("Unknown semantic DAG work kind: %s", work.kind)
+        logger.warning("Unknown semantic tree work kind: %s", work.kind)
 
     async def _dispatch_dir(self, dir_uri: str, parent_uri: Optional[str]) -> bool:
         """Lazy-dispatch tasks for a directory when it is triggered."""
@@ -589,7 +589,7 @@ class SemanticDagExecutor:
                         "abstract": abstract,
                     }
                 pending = len(required_file_paths) + len(required_children_dirs)
-                node = DirNode(
+                node = SemanticTreeNode(
                     uri=dir_uri,
                     children_dirs=children_dirs,
                     file_paths=file_paths,
@@ -632,7 +632,7 @@ class SemanticDagExecutor:
             else:
                 pending = len(required_file_paths)
 
-            node = DirNode(
+            node = SemanticTreeNode(
                 uri=dir_uri,
                 children_dirs=children_dirs,
                 file_paths=file_paths,
@@ -718,7 +718,7 @@ class SemanticDagExecutor:
         dir_uri: str,
         children_dirs: List[str],
         file_paths: List[str],
-    ) -> DirNode:
+    ) -> SemanticTreeNode:
         """Sample the target directory first, then read only existing summaries."""
         candidates = sorted(
             [("file", uri) for uri in file_paths] + [("directory", uri) for uri in children_dirs],
@@ -744,7 +744,7 @@ class SemanticDagExecutor:
             ctx=self._ctx,
             lock=self._lock,
         )
-        return DirNode(
+        return SemanticTreeNode(
             uri=dir_uri,
             children_dirs=selected_dirs,
             file_paths=selected_files,
@@ -770,7 +770,7 @@ class SemanticDagExecutor:
             entries = await self._viking_fs.ls(uri, node_limit=LS_ALL_NODES, ctx=self._ctx)
         except Exception as e:
             logger.warning(
-                f"[SemanticDagExecutor] Failed to list directory {uri}: {e} from {from_hint}"
+                f"[SemanticTreeExecutor] Failed to list directory {uri}: {e} from {from_hint}"
             )
             raise
 
@@ -1229,9 +1229,9 @@ class SemanticDagExecutor:
         if not node or node.overview_scheduled:
             return
         node.overview_scheduled = True
-        self._schedule_work(DagWork(kind="overview", dir_uri=dir_uri))
+        self._schedule_work(SemanticTreeWork(kind="overview", dir_uri=dir_uri))
 
-    def _finalize_file_summaries(self, node: DirNode) -> List[Dict[str, str]]:
+    def _finalize_file_summaries(self, node: SemanticTreeNode) -> List[Dict[str, str]]:
         summaries: List[Dict[str, str]] = []
         for idx, file_path in enumerate(node.file_paths):
             if node.sampled_file_paths is not None and file_path not in node.sampled_file_paths:
@@ -1245,7 +1245,7 @@ class SemanticDagExecutor:
 
     def _select_direct_media_overview(
         self,
-        node: DirNode,
+        node: SemanticTreeNode,
         file_summaries: List[Dict[str, str]],
     ) -> Optional[str]:
         if len(node.file_paths) != 1 or node.children_dirs or len(file_summaries) != 1:
@@ -1280,7 +1280,7 @@ class SemanticDagExecutor:
     def stale(self) -> bool:
         return self._stale
 
-    async def _finalize_children_abstracts(self, node: DirNode) -> List[Dict[str, str]]:
+    async def _finalize_children_abstracts(self, node: SemanticTreeNode) -> List[Dict[str, str]]:
         results: List[Dict[str, str]] = []
         for idx, child_uri in enumerate(node.children_dirs):
             if (
@@ -1339,7 +1339,7 @@ class SemanticDagExecutor:
             metadata=metadata,
             consume_pending=consume_pending,
             lock=self._lock,
-            log_prefix="[SemanticDag]",
+            log_prefix="[SemanticTree]",
         )
         if not wrote.wrote:
             self._stale = True
@@ -1438,7 +1438,7 @@ class SemanticDagExecutor:
                     raise
                 except Exception:
                     need_vectorize = False
-                    logger.info(f"[SemanticDag] {dir_uri} write failed, skipping")
+                    logger.info(f"[SemanticTree] {dir_uri} write failed, skipping")
 
         except AbstractOverviewFormatError:
             raise
@@ -1547,8 +1547,8 @@ class SemanticDagExecutor:
         await self._on_child_done(parent_uri, dir_uri, abstract or "")
         self._release_dir_node(dir_uri)
 
-    def get_stats(self) -> DagStats:
-        return DagStats(
+    def get_stats(self) -> SemanticTreeStats:
+        return SemanticTreeStats(
             total_nodes=self._stats.total_nodes,
             pending_nodes=self._stats.pending_nodes,
             in_progress_nodes=self._stats.in_progress_nodes,

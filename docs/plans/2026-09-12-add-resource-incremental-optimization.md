@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python asyncio、ParserRouter/ParserRegistry、VikingFS/AGFS、TOS/S3、本地向量后端、现有 SOURCE/POST_PROCESS/semantic/embedding 队列。
 
-**状态:** P1-P5 核心链路及第 18 章的 SemanticPlan、同步前移、最小增量 DAG 已在独立 worktree 实施，并完成 shared HTTP + 真实 S3 + 本地向量库验证。远程分支已有 P1-P5 提交 `a1e56aca9`，SemanticPlan 阶段在最终验证后追加提交；历史源码锚点仅供定位，行号随实施已发生变化。
+**状态:** P1-P5 核心链路及第 18 章的 SemanticPlan、同步前移、最小增量 语义树 已在独立 worktree 实施，并完成 shared HTTP + 真实 S3 + 本地向量库验证。远程分支已有 P1-P5 提交 `a1e56aca9`，SemanticPlan 阶段在最终验证后追加提交；历史源码锚点仅供定位，行号随实施已发生变化。
 
 ---
 
@@ -70,7 +70,7 @@
 | 物化到 worker 本地 | 55.68 秒 | 57.57 秒 | 枚举远程快照并下载输入 |
 | 解析及临时产物上传 | 100.65 秒 | 99.64 秒 | 构造完整新树并逐文件写 AGFS temp |
 | 同步和 diff | 124.04 秒 | 112.07 秒 | 遍历新旧树、stat、读双方正文、执行同步 |
-| 语义 DAG | 68.02 秒 | 59.37 秒 | 文件摘要复用/重建、目录汇总及后代任务 |
+| 语义树 | 68.02 秒 | 59.37 秒 | 文件摘要复用/重建、目录汇总及后代任务 |
 | 清理 | 10.20 秒 | 12.88 秒 | 删除源暂存和解析临时目录 |
 | 全队列完成总耗时 | 473.27 秒 | 452.07 秒 | 包含父目录刷新及队列完成等待 |
 
@@ -120,7 +120,7 @@ ParseArtifactRef + 完整性状态
                   ↓
 明确的 changes + 修复集合 + 缓存摘要
                   ↓
-增量语义 DAG → embedding → 稳定 ID upsert
+增量语义树 → embedding → 稳定 ID upsert
                   ↓
 报告成功/失败并清理产物
 ```
@@ -371,7 +371,7 @@ URI 规范化、租户和权限范围必须一致。已有索引转移的完整�
 
 新版本队列字段上线采用受控升级：先停止新接入、排空旧任务，再统一升级生产者和消费者，避免旧 worker 不识别本地产物引用。旧向量数据兼容不等于新旧代码可以任意混跑。
 
-## 9. 优化五：摘要复用与增量 DAG
+## 9. 优化五：摘要复用与增量 语义树
 
 ### 9.1 正确的判断顺序
 
@@ -387,17 +387,17 @@ URI 规范化、租户和权限范围必须一致。已有索引转移的完整�
 
 ### 9.2 只处理必要范围
 
-diff 为空且没有孤儿修复或现有目录刷新策略要求的工作时直接返回，不启动全树 DAG；不额外检查文件的历史更新失败。
+diff 为空且没有孤儿修复或现有目录刷新策略要求的工作时直接返回，不启动全树 语义树；不额外检查文件的历史更新失败。
 
 非空变化集合只调度变化文件、受影响目录及其必要祖先。未变子目录可复用目录摘要；变化目录由“变化文件的新摘要 + 未变文件的已存 abstract + 子目录摘要”重新汇总。目录采样及大小策略保持原配置，不能借性能优化偷偷改摘要覆盖范围。
 
-上述为目标行为，不代表当前实现已经完成目录级剪枝。当前 `SemanticDagExecutor` 在 `recursive=True` 时仍会枚举并调度所有子目录及其直接文件；`changes` 主要用于在文件节点内部跳过正文、LLM 和 embedding。因此当前增量虽然能将模型调用收敛到变化文件，目录 `ls`、DAG 节点创建、未变摘要读取和状态维护仍与整棵资源树规模相关。第 18 章的带状态裁剪 tree snapshot 必须补齐真正的受影响路径最小 DAG。
+上述为目标行为，不代表当前实现已经完成目录级剪枝。当前 `SemanticTreeExecutor` 在 `recursive=True` 时仍会枚举并调度所有子目录及其直接文件；`changes` 主要用于在文件节点内部跳过正文、LLM 和 embedding。因此当前增量虽然能将模型调用收敛到变化文件，目录 `ls`、语义树节点创建、未变摘要读取和状态维护仍与整棵资源树规模相关。第 18 章的带状态裁剪 tree snapshot 必须补齐真正的受影响路径最小语义树。
 
 `changes=None` 表示未知，`changes={added:[], modified:[], deleted:[]}` 表示明确无变化；修正因 bool(empty) 而退回自比较的路径。
 
 保留现有目录 freshness 延迟刷新策略：达到阈值前记 pending、达到后触发刷新的既有逻辑照常运行，在文件落库前后按现有协议登记。但本期不为“刷新执行失败”新增恢复状态机；目录摘要刷新失败记录后跳过该目录节点，由第 8.2 节的显式 reindex 修复。不能因为文件向量已更新，就漏掉当次应触发的父目录摘要刷新。
 
-主要锚点：`storage/queuefs/semantic_dag.py:608`、`:631`、`:650`、`:762`；`semantic_processor.py:448`、`:499`、`:1177`。`utils/resource_processor.py:669` 的 vectors_only 全树向量化也要改为消费变化/修复集合。
+主要锚点：`storage/queuefs/semantic_executor.py:608`、`:631`、`:650`、`:762`；`semantic_processor.py:448`、`:499`、`:1177`。`utils/resource_processor.py:669` 的 vectors_only 全树向量化也要改为消费变化/修复集合。
 
 ## 10. 优化六：同名文件覆盖与稳定 ID 更新
 
@@ -431,7 +431,7 @@ diff 为空且没有孤儿修复或现有目录刷新策略要求的工作时直
 | 解析/必要产物写入失败 | 不进入同步，不误删目标 |
 | tree/向量分页失败或不完整 | 不生成删除计划，不把错误当空集合 |
 | 正式文件写入/删除失败 | 报失败并记录失败路径及已发生变化；不新增文件待修复状态或自动补偿 |
-| 文件或目录语义请求失败 | 记录失败并跳过当前 DAG 节点，其他可执行节点继续；允许摘要、sidecar 和目录传播不完整，不新增 pending，由调用方显式 reindex 修复 |
+| 文件或目录语义请求失败 | 记录失败并跳过当前 语义树节点，其他可执行节点继续；允许摘要、sidecar 和目录传播不完整，不新增 pending，由调用方显式 reindex 修复 |
 | embedding/upsert/delete/update-fields 失败 | 沿用队列节点容错并允许与正式文件不一致；不新增 pending 或回滚，由调用方显式 reindex 修复后再依赖增量比较 |
 | `SemanticPlan` 消息入队失败 | 清理解析 artifact、释放目标锁并使 add_resources 任务失败；不能把“正式树已提交但无后续任务”报告为成功 |
 | 清理失败 | 保留可定位日志和清理债务，不伪造正文回滚 |
@@ -457,7 +457,7 @@ HTTP 异步接入成功只表示任务被接受。`wait=true` 或最终任务状
 | P2 统一产物接口 | 新 output.py；StorageConfig；ParseResult/Router/各 parser；TreeBuilder/队列交接 | 先 AGFS 行为不变，再本地模式；两种模式输出一致、异常清理一致 |
 | P3 指纹与写回防护 | Context/schema/projection/embedding/write/reindex/copy/move/memory | 正常路径 MD5 与最终字节一致；缺值兼容；失败报错且显式 reindex 可修复；不新增 pending 或失败前置失效；旧队列写回不能覆盖新内容 |
 | P4 统一快照与 diff | _sync.py、vector metadata 查询、resource_processor、semantic_processor | 完整决策表、类型冲突、无索引修复、分页及权限边界通过 |
-| P5 增量 DAG 与覆盖 | semantic_dag、summary/vectorization、stable upsert；图片重写前移与 P3/P4 联调 | 健康 no-op 零模型调用；小变更仅处理叶子和必要祖先 |
+| P5 增量 语义树 与覆盖 | semantic_executor、summary/vectorization、stable upsert；图片重写前移与 P3/P4 联调 | 健康 no-op 零模型调用；小变更仅处理叶子和必要祖先 |
 | P6 A/B 与上线验证 | benchmark runner、混合格式集成测试、故障与并发测试 | 正确性全通过、量化收益、AGFS 和本地模式均可交付 |
 
 P2 先引入 AGFS adapter 再引入 local adapter，便于隔离“业务行为变化”和“存储后端变化”。P3 的字段兼容、失败上报、显式修复和并发写回防护就绪前，不启用 MD5 快速跳过；P4/P5 是最终联合收益，不能以某个单阶段完成代表整个方案可上线。
@@ -474,7 +474,7 @@ P2 先引入 AGFS adapter 再引入 local adapter，便于隔离“业务行为�
 - `tests/parse/test_parser_router.py`、`test_parser_config_wiring.py`、`test_directory_parser_routing.py`：输出配置和上下文贯通。
 - `tests/ingest/test_parsers.py`：代表性格式的产物兼容。
 - `tests/server/test_resources_temp_upload_token.py`、`test_temp_upload_store_async_io.py`：shared 消费与本地副本生命周期。
-- `tests/storage/test_semantic_dag_incremental.py`：零变化、摘要复用、必要祖先、摘要缺失不默认 embedding。
+- `tests/storage/test_semantic_executor_incremental.py`：零变化、摘要复用、必要祖先、摘要缺失不默认 embedding。
 - `tests/storage/test_content_write_processing_mode.py`、`tests/utils/test_resource_processor_processing_mode.py`：不同模式和所有写入分支。
 - `tests/benchmark/test_ingest_profile.py`：计时/bytes/diff 统计。
 
@@ -507,7 +507,7 @@ P2 先引入 AGFS adapter 再引入 local adapter，便于隔离“业务行为�
 ```bash
 PYTHONPATH="$PWD:$PWD/sdk/python" .venv/bin/python -m pytest \
   tests/benchmark/test_ingest_profile.py \
-  tests/storage/test_semantic_dag_incremental.py \
+  tests/storage/test_semantic_executor_incremental.py \
   tests/utils/test_resource_processor_processing_mode.py \
   tests/storage/test_content_write_processing_mode.py \
   tests/test_upload_utils.py -q
@@ -524,7 +524,7 @@ PYTHONPATH="$PWD:$PWD/sdk/python" .venv/bin/python -m pytest \
 - B1：shared 去二次暂存。
 - B2：统一接口 + 本地产物。
 - B3：快照/MD5 diff + 覆盖。
-- B4：全部优化 + abstract 复用 + 增量 DAG。
+- B4：全部优化 + abstract 复用 + 增量 语义树。
 
 A1 与 B4 是主对照，中间组用于解释收益来源。相同语料提交、过滤规则、模型/并发、向量维度、网络位置、后端缓存策略、队列配置；每组单独 workspace 和远程 prefix，不共享目标数据。
 
@@ -595,7 +595,7 @@ PYTHONPATH="$PWD:$PWD/sdk/python" .venv/bin/python benchmark/custom/ingest_profi
 
 #### 计时与校验方法
 
-通过 `TempUploadStore.save_upload`、`_resolve_shared`、SOURCE stage/materialize、解析入口、正式树落地、sync、semantic DAG、模型与向量写入等探针记录调用区间；HTTP 上传、导入返回和所有队列完成分别记录墙钟时间。
+通过 `TempUploadStore.save_upload`、`_resolve_shared`、SOURCE stage/materialize、解析入口、正式树落地、sync、semantic tree、模型与向量写入等探针记录调用区间；HTTP 上传、导入返回和所有队列完成分别记录墙钟时间。
 
 主计时从发起上传到所有队列完成，不含服务初始化、客户端 ZIP 打包和事后校验。客户端打包单独报告。对全部预期文件检查存在性，对实际存在文件逐一比对 bytes，同时核对目标 L2 索引集合，不仅检查 API success。检查失败立即停止后续场景。
 
@@ -615,7 +615,7 @@ PYTHONPATH="$PWD:$PWD/sdk/python" .venv/bin/python benchmark/custom/ingest_profi
 | 首次正式资源树落地 | 119.82 秒 | — |
 | 增量树同步及逐文件 diff | — | 146.05 秒 |
 | 增量图片引用重写 | — | 0.18 秒 |
-| 语义 DAG，含父目录处理 | 73.59 秒 | 71.79 秒 |
+| 语义树，含父目录处理 | 73.59 秒 | 71.79 秒 |
 | 清理任务临时目录，两次调用的时间并集 | 11.63 秒 | 10.12 秒 |
 | `POST /resources` 返回耗时 | 337.32 秒 | 359.27 秒 |
 | 从上传开始到全部队列完成 | 348.75 秒 | 370.87 秒 |
@@ -670,7 +670,7 @@ PYTHONPATH="$PWD:$PWD/sdk/python" .venv/bin/python benchmark/custom/ingest_profi
 
 在本地向量库、S3 正式文件存储、`temp_upload=shared`、`parse_output=local` 下，使用 40 个已跟踪 Python 文件（420,750 bytes、11,532 行）执行 initial、健康 no-op、单文件修改。每轮 shared 上传后由 benchmark 固定等待 5 秒再调用 `add_resources`，用于隔离测试对象存储传播时序；该等待只属于客户端评测准备，不计入 `upload_http_s`、`ingest_http_s` 或阶段耗时。正式 shared 消费代码不增加重试。
 
-| 场景 | 端到端耗时（含 5s 评测等待） | shared 上传 | shared 物化 | 本地解析 | local persist/diff | 语义 DAG | 文件摘要 | overview | embedding |
+| 场景 | 端到端耗时（含 5s 评测等待） | shared 上传 | shared 物化 | 本地解析 | local persist/diff | 语义树 | 文件摘要 | overview | embedding |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | initial | 62.82s | 0.20s | 0.19s | 0.28s | persist 4.52s | 48.93s | 40 | 8 | 56 |
 | no-op | 11.48s | 0.11s | 0.12s | 0.18s | diff 0.04s | 3.43s | 0 | 0 | 0 |
@@ -689,7 +689,7 @@ no-op 相对同一代码版本下普通本地入口（仍有 SOURCE 暂存和 wo
 - `.scratch/ingest-profile/shared-local-final40-v2-20260913-010502/01-noop.json`
 - `.scratch/ingest-profile/shared-local-final40-v2-20260913-010502/02-edit_one.json`
 
-当前样本说明文件级增量已经收敛：no-op 不重算文件摘要和向量，单文件修改只重新生成 1 个文件摘要。单文件修改仍有 4 次目录 overview LLM 调用及父级刷新，约 30.85s 的语义 DAG 是下一阶段最明显的优化空间。
+当前样本说明文件级增量已经收敛：no-op 不重算文件摘要和向量，单文件修改只重新生成 1 个文件摘要。单文件修改仍有 4 次目录 overview LLM 调用及父级刷新，约 30.85s 的语义树 是下一阶段最明显的优化空间。
 
 ### 14.7 shared-only 严格基线对比
 
@@ -715,16 +715,16 @@ no-op 相对同一代码版本下普通本地入口（仍有 SOURCE 暂存和 wo
 | initial / shared 物化 | 0.14s | 0.52s | 两组都只下载一次 shared ZIP |
 | initial / 解析产物写入 | 11.60s | 0.21s | AGFS temp 全量写入改为 local artifact |
 | initial / 正式落库 | 10.38s | 2.76s | 基线 persist temp tree；优化组 local→正式 S3 |
-| initial / 语义 DAG | 66.98s | 42.93s | 首次导入仍需全量摘要/向量 |
+| initial / 语义树 | 66.98s | 42.93s | 首次导入仍需全量摘要/向量 |
 | no-op / shared 上传 | 0.13s | 0.15s | 基本一致 |
 | no-op / shared 物化 | 0.13s | 0.14s | 基本一致 |
 | no-op / 解析产物写入 | 11.97s | 0.28s | 避免 AGFS temp 全量上传 |
 | no-op / tree diff/apply | sync 9.86s | local diff 0.04s | MD5 内存比较，正式内容零上传 |
-| no-op / 语义 DAG | 41.92s | 3.06s | 向量 abstract 复用；文件摘要/embedding 均为 0 |
+| no-op / 语义树 | 41.92s | 3.06s | 向量 abstract 复用；文件摘要/embedding 均为 0 |
 | no-op / 清理 | 2.21s | local cleanup 未单独计时 | 优化组本地产物终态清理后目录为空 |
 | edit-one / 解析产物写入 | 10.91s | 0.26s | local artifact |
 | edit-one / tree diff/apply | sync 14.86s | local diff 0.13s | 只上传一个变化文件 |
-| edit-one / 语义 DAG | 33.92s | 27.07s | 文件摘要 15→1，embedding 27→9；仍有目录刷新 |
+| edit-one / 语义树 | 33.92s | 27.07s | 文件摘要 15→1，embedding 27→9；仍有目录刷新 |
 
 工作量对照：
 
@@ -763,19 +763,19 @@ no-op 相对同一代码版本下普通本地入口（仍有 SOURCE 暂存和 wo
 | initial / shared 物化 | 0.23s | 0.56s |
 | initial / 解析及产物写入 | 148.78s | 1.00s |
 | initial / 正式落库 | persist 151.99s | local persist 41.80s |
-| initial / 语义 DAG | 83.15s | 90.55s |
+| initial / 语义树 | 83.15s | 90.55s |
 | no-op / shared 上传 | 0.61s | 0.54s |
 | no-op / shared 物化 | 0.28s | 0.35s |
 | no-op / 解析及产物写入 | 149.89s | 0.86s |
 | no-op / diff/apply | sync 191.60s | local diff 0.27s |
-| no-op / 语义 DAG | 79.93s | 4.09s |
+| no-op / 语义树 | 79.93s | 4.09s |
 | no-op / 清理 | 4.34s | local cleanup 未单独计时 |
 | edit-one / 解析及产物写入 | 147.42s | 1.20s |
 | edit-one / diff/apply | sync 195.35s | local diff 0.20s |
-| edit-one / 语义 DAG | 66.73s | 32.04s |
+| edit-one / 语义树 | 66.73s | 32.04s |
 | edit-one / 清理 | 4.44s | local cleanup 未单独计时 |
 
-阶段时间使用 `wall_union_s`，阶段间存在嵌套/并行，不能直接求和还原端到端。initial 的语义 DAG 波动由真实模型时延主导；两组工作量完全相同（642 文件摘要、77 overview、132 LLM、796 embedding），因此不把 83.15s 与 90.55s 的差异解释为算法回退。
+阶段时间使用 `wall_union_s`，阶段间存在嵌套/并行，不能直接求和还原端到端。initial 的语义树 波动由真实模型时延主导；两组工作量完全相同（642 文件摘要、77 overview、132 LLM、796 embedding），因此不把 83.15s 与 90.55s 的差异解释为算法回退。
 
 #### 完整仓库增量工作量
 
@@ -821,12 +821,12 @@ no-op 相对同一代码版本下普通本地入口（仍有 SOURCE 暂存和 wo
 | 指标 | 剪枝前 | 剪枝后 |
 |---|---:|---:|
 | 端到端（含 5s 等待） | 44.87s | 23.22s |
-| 语义 DAG | 32.04s | 5.38s |
+| 语义树 | 32.04s | 5.38s |
 | 文件摘要 | 1 | 1 |
 | overview / LLM | 3 / 3 | 0 / 0 |
 | embedding / upsert | 7 / 7 | 1 / 1 |
 
-本次端到端降低 48.3%，语义 DAG 降低 83.2%。两轮远程服务时延并非严格受控，因此耗时只作为单样本量级；调用数收敛是确定性的功能证据。保留的 1 次 embedding 用于更新修改文件的 L2 记录和 MD5，尚未引入“复用旧向量、仅更新标量”的额外写入协议。证据目录：`.scratch/ingest-profile/shared-local-abstract-stop-full-20260913-1026`。
+本次端到端降低 48.3%，语义树 降低 83.2%。两轮远程服务时延并非严格受控，因此耗时只作为单样本量级；调用数收敛是确定性的功能证据。保留的 1 次 embedding 用于更新修改文件的 L2 记录和 MD5，尚未引入“复用旧向量、仅更新标量”的额外写入协议。证据目录：`.scratch/ingest-profile/shared-local-abstract-stop-full-20260913-1026`。
 
 证据目录：
 
@@ -950,7 +950,7 @@ diff 与快照优化必须覆盖所有落库路径，不能只优化 semantic �
 
 | 路径 | 落库入口 | diff 应用点 |
 |---|---|---|
-| 目录 semantic_and_vectors | `resource_processor.finish_prepared_resource` → semantic DAG | 统一 DiffPlan |
+| 目录 semantic_and_vectors | `resource_processor.finish_prepared_resource` → semantic tree | 统一 DiffPlan |
 | 目录 vectors_only | `resource_processor.py:669` 全树向量化 | 改为消费 DiffPlan 的变化/修复集合，不再全树 |
 | 单文件目标 | `resource_processor.py:544` 单文件分支 | 单文件 diff（比对 MD5/正文） |
 | 不建索引模式 | 按模式跳过向量 | 只做文件 diff，不偷偷建索引 |
@@ -1021,18 +1021,18 @@ diff 与快照优化必须覆盖所有落库路径，不能只优化 semantic �
 
 每个 P 阶段合入前自查：是否引入了与已有函数重复的过滤/比较/hash 逻辑；后端实现里是否混入业务规则；是否有临时/正式路径类型被字符串拼接混用。发现即上移或合并，不留“先复制后统一”的债务。
 
-## 18. 语义规划前移与最小增量 DAG
+## 18. 语义规划前移与最小增量 语义树
 
-本章记录 P1-P5 之后已经实施的设计，**本轮范围只覆盖目录型 `add_resources` 的 `semantic_and_vectors` 路径**。该路径在入 SemanticQueue 前完成 local/AGFS 文件树提交和业务规划，向队列传递明确、后端无关的语义计划，并让增量计划只构造受影响路径的最小 DAG。单文件 add_resources、`vectors_only`、不建索引路径，以及 resource/skill `write`、`batch-write`、`reindex`、memory 和通用手工 `summarize` 本轮保持现有接口和行为；新接口为它们保留未来接入空间，但不把迁移这些入口列为本轮交付条件。
+本章记录 P1-P5 之后已经实施的设计，**本轮范围只覆盖目录型 `add_resources` 的 `semantic_and_vectors` 路径**。该路径在入 SemanticQueue 前完成 local/AGFS 文件树提交和业务规划，向队列传递明确、后端无关的语义计划，并让增量计划只构造受影响路径的最小语义树。单文件 add_resources、`vectors_only`、不建索引路径，以及 resource/skill `write`、`batch-write`、`reindex`、memory 和通用手工 `summarize` 本轮保持现有接口和行为；新接口为它们保留未来接入空间，但不把迁移这些入口列为本轮交付条件。
 
 ### 18.1 当前问题与设计边界
 
-`SemanticQueue` 本身主要负责消息存取和 coalesce，真正影响 `add_resources` 解耦的逻辑集中在 `SemanticProcessor.on_dequeue`：AGFS 临时树同步、根据 `uri/target_uri/changes` 推断增量模式、恢复 parse artifact，以及拼装 DAG 参数。队列反序列化、stale、熔断重试、身份和锁恢复、ACK、request tracking、父目录 freshness 等执行时职责本轮保留。
+`SemanticQueue` 本身主要负责消息存取和 coalesce，真正影响 `add_resources` 解耦的逻辑集中在 `SemanticProcessor.on_dequeue`：AGFS 临时树同步、根据 `uri/target_uri/changes` 推断增量模式、恢复 parse artifact，以及拼装 语义树 参数。队列反序列化、stale、熔断重试、身份和锁恢复、ACK、request tracking、父目录 freshness 等执行时职责本轮保留。
 
 | 入口 | 当前文件状态 | 当前语义调用方式 | 主要问题 |
 |---|---|---|---|
 | `add_resources` local 产物 | 入队前已完成 diff 和正式树更新 | 携带 `changes/file_md5s/file_abstracts/artifact_ref` 入队 | 参数分散，仍可能递归遍历无变化子树 |
-| `add_resources` AGFS 产物 | 入队时可能仍是临时树 | consumer 内 `_sync_topdown_recursive` 后再跑 DAG | 文件写入业务和语义队列耦合 |
+| `add_resources` AGFS 产物 | 入队时可能仍是临时树 | consumer 内 `_sync_topdown_recursive` 后再跑 语义树 | 文件写入业务和语义队列耦合 |
 | 其他入口 | 各自保持现状 | 继续构造旧 `SemanticMsg` 或直接调用现有服务 | 明确不在本轮迁移 |
 
 目标职责边界：
@@ -1052,12 +1052,12 @@ SemanticQueue / worker adapter
   - 新 add_resources 消息不再触发临时树同步或增量模式推断
   - 旧消息继续走现有兼容分支
 
-SemanticDagExecutor
-  - 将 add_resources plan 中带状态的 tree snapshot 编译为 DAG 并执行
+SemanticTreeExecutor
+  - 将 add_resources plan 中带状态的 tree snapshot 编译为 语义树 并执行
   - 生成/复用文件摘要，聚合目录 L0/L1，按 outputs 投递 embedding
 ```
 
-本轮不为抽象层次而新建空壳服务。优先在现有 `SemanticProcessor` 与 `SemanticDagExecutor` 边界引入一个清晰 plan；只有当后续第二个入口实际接入时，再根据重复代码决定是否抽出独立 `SemanticExecutionService`。队列 worker 仍负责真正执行时才能决定的事情：消息是否 stale、熔断和重试、锁的接管与最终释放、ACK，以及执行结果驱动的父目录 freshness。
+本轮不为抽象层次而新建空壳服务。优先在现有 `SemanticProcessor` 与 `SemanticTreeExecutor` 边界引入一个清晰 plan；只有当后续第二个入口实际接入时，再根据重复代码决定是否抽出独立 `SemanticExecutionService`。队列 worker 仍负责真正执行时才能决定的事情：消息是否 stale、熔断和重试、锁的接管与最终释放、ACK，以及执行结果驱动的父目录 freshness。
 
 ### 18.2 add_resources 语义参数模型
 
@@ -1137,16 +1137,16 @@ class SemanticPlan:
 语义约束：
 
 - 完整 `ResourceTreeManifest` 只在 ResourceProcessor 内部用于 diff、正式树提交和语义裁剪，不直接进入队列。`SemanticPlan.tree` 是带状态的裁剪语义快照：首次导入的当前节点均为 `added`；增量只包含变化节点、可能执行聚合的目录，以及这些目录的全部直接子项。路径均相对 `root_uri`，不包含 `.abstract.md`、`.overview.md` 及控制文件。
-- tree snapshot 不重复保存 `direct_children`。Semantic worker 按 `relative_path + kind` 一次性构造 `parent -> direct files/direct directories` 邻接表；本轮裁剪必须保证每个候选聚合目录的全部当前直接子项均作为 entry 保留。裁剪阶段不做 sampling，也不复制 freshness/overview 的采样策略；Semantic DAG 在目录真正被激活时继续调用现有唯一的 `deterministic_sample()`。
+- tree snapshot 不重复保存 `direct_children`。Semantic worker 按 `relative_path + kind` 一次性构造 `parent -> direct files/direct directories` 邻接表；本轮裁剪必须保证每个候选聚合目录的全部当前直接子项均作为 entry 保留。裁剪阶段不做 sampling，也不复制 freshness/overview 的采样策略；Semantic tree 在目录真正被激活时继续调用现有唯一的 `deterministic_sample()`。
 - `indexed_records` 是构造 diff 时已查询到的轻量旧索引快照。文件条目通常携带 L2，目录条目按目录聚合需要携带 L0；除 `record_id/level/abstract/md5` 外，只携带 full upsert 必须保留的非向量业务标量，如 `created_at/active_count/name/description/tags/search_tags`，不携带 dense `vector` 或 `sparse_vector`。`uri/context_type/account_id/owner_user_id` 等身份字段由 `root_uri`、entry、当前请求上下文重新推导并校验；ACL 延续现有 materialization 逻辑，不信任 plan 中可伪造的权限字段。
-- entry 的 `state` 是 Semantic 的唯一节点状态来源，不再维护一份重复的 `ChangeSelection`。`added/modified` 文件需要生成摘要并维护 L2；`added/deleted` 节点表示目录成员或类型变化；`unchanged` 节点只作为候选目录的直接聚合输入。执行器根据这些状态构造 DAG，不得再扫描整棵子树寻找变化。
+- entry 的 `state` 是 Semantic 的唯一节点状态来源，不再维护一份重复的 `ChangeSelection`。`added/modified` 文件需要生成摘要并维护 L2；`added/deleted` 节点表示目录成员或类型变化；`unchanged` 节点只作为候选目录的直接聚合输入。执行器根据这些状态构造 语义树，不得再扫描整棵子树寻找变化。
 - deleted entry 保留第一阶段 inventory 中属于该节点的旧 `indexed_records`，Semantic 据 `state=deleted` 直接生成精确 DELETE；不在 plan 顶层重复记录。DiffPlan 的 `repair` 归一化为 `state=modified` 且没有旧 L2；Semantic 据此完整重建 L2，并因旧摘要缺失保守决定目录聚合。`structural` 归一化为当前新类型的 `state=added`，同路径旧类型记录保留在该 entry 的 `indexed_records`，Semantic 删除与新 kind 不匹配的旧 level。只有纯 `orphan_vectors` 没有对应树节点，因此单独进入 `orphan_vector_deletes`。`needs_body_compare` 必须在 plan 生成前归并为 `unchanged/modified`。
 - add_resources 只在需要生成语义 sidecar 时创建 plan；`outputs.vectorize=False` 表示生成文件/目录语义但不投递 L0/L1/L2 embedding，对应 `summarize=True, build_index=False`。`vectors_only` 不创建 plan。
-- 语义 repair 与 `outputs.vectorize` 解耦：`summarize=True, build_index=False` 时，缺 L2 摘要的文件及缺 L0/L1 的目录仍标记为 `modified` 并按需进入 DAG，只禁止向 EmbeddingQueue 投递。若目标范围完全没有语义索引，则保守重建当前完整目录语义，不能把无索引误判为健康 no-op。
+- 语义 repair 与 `outputs.vectorize` 解耦：`summarize=True, build_index=False` 时，缺 L2 摘要的文件及缺 L0/L1 的目录仍标记为 `modified` 并按需进入 语义树，只禁止向 EmbeddingQueue 投递。若目标范围完全没有语义索引，则保守重建当前完整目录语义，不能把无索引误判为健康 no-op。
 - 已存在记录但聚合必需的 L2/L0 `abstract` 为空时，也不能当作可复用依赖；plan builder 将该文件或子目录定向提升为 `modified`。目录 repair 会补入其全部直接子项用于原采样和聚合逻辑，不递归扫描无关子树。
 - entry 相对路径必须规范化且不得越过 root，同一路径只能出现一次。`added/modified` 必须存在于当前正式树；`deleted` 是唯一允许不存在于当前树的 tombstone，保留旧 kind 和待删 `indexed_records`，但不得读取正文。构造当前树邻接表时排除 deleted tombstone；它只作为父目录结构变化和索引删除信号。
-- DAG 拓扑编译规则是纯内存操作：根目录用空相对路径 `""` 表示；entry 的父路径由规范化相对路径计算，不允许用“最近存在祖先”代替真实直接父目录。首次导入的裁剪树包含完整节点，可还原原全量 DAG；增量裁剪树只还原受影响路径的最小 DAG，这是预期差异。
-- entry 的 `md5` 必须对应正式树最终 bytes；`indexed_records[].md5/abstract` 是 plan 生成时读到的旧索引状态。修改文件通过“本次生成摘要与旧 L2 abstract”比较决定是否停止目录传播，旧摘要不能掩盖文件内容变化。DAG 运行中的新摘要保存在运行时结果缓存，不回写 frozen plan。
+- 语义树 拓扑编译规则是纯内存操作：根目录用空相对路径 `""` 表示；entry 的父路径由规范化相对路径计算，不允许用“最近存在祖先”代替真实直接父目录。首次导入的裁剪树包含完整节点，可还原原全量 语义树；增量裁剪树只还原受影响路径的最小语义树，这是预期差异。
+- entry 的 `md5` 必须对应正式树最终 bytes；`indexed_records[].md5/abstract` 是 plan 生成时读到的旧索引状态。修改文件通过“本次生成摘要与旧 L2 abstract”比较决定是否停止目录传播，旧摘要不能掩盖文件内容变化。语义树 运行中的新摘要保存在运行时结果缓存，不回写 frozen plan。
 
 不再维护独立的 `file_md5s` 或 `previous_abstracts` 映射；同一路径的拓扑、最终 MD5 和旧索引快照放在一个 entry 中，避免多张表按 URI 对齐。当前 `get_l2_diff_records_under_uri()` 只返回 L2，不能满足新计划；需新增或扩展为目标前缀下全层级 inventory。完整 inventory 查询结束后再裁剪，不能为了少查数据而破坏孤儿检测、目录记录定位和 diff 完整性。
 
@@ -1185,11 +1185,11 @@ class SemanticMsg:
     plan: SemanticPlan | None = None
 ```
 
-只有 add_resources 新生产者设置 `plan_version=1` 和 `plan`。没有 plan 的旧消息继续走现有路径，确保 write、batch-write、reindex、父目录刷新、copy/delete 和历史队列消息不受影响。旧 consumer 不理解 manifest/minimal-DAG 语义，因此本轮不承诺新 add_resources producer 与旧 consumer 混跑；部署时先升级 consumer，再启用新 producer，并在移除旧字段前排空历史消息。兼容期可按需镜像旧字段用于回滚和诊断，但不能把旧 consumer 的退化执行当作正确性或性能保证。后续其他入口迁移完成后，再决定是否引入独立 `SemanticJob`。
+只有 add_resources 新生产者设置 `plan_version=1` 和 `plan`。没有 plan 的旧消息继续走现有路径，确保 write、batch-write、reindex、父目录刷新、copy/delete 和历史队列消息不受影响。旧 consumer 不理解 manifest/minimal-tree 语义，因此本轮不承诺新 add_resources producer 与旧 consumer 混跑；部署时先升级 consumer，再启用新 producer，并在移除旧字段前排空历史消息。兼容期可按需镜像旧字段用于回滚和诊断，但不能把旧 consumer 的退化执行当作正确性或性能保证。后续其他入口迁移完成后，再决定是否引入独立 `SemanticJob`。
 
-### 18.3 带状态 tree snapshot 必须生成受影响路径最小 DAG
+### 18.3 带状态 tree snapshot 必须生成受影响路径最小语义树
 
-带状态 tree snapshot 的关键验收条件不是“最终少调用模型”，而是“无变化子树不进入 DAG”。当前实现的 `recursive=True + changes` 仍会递归调度所有子目录，这是本阶段必须修掉的性能边界。
+带状态 tree snapshot 的关键验收条件不是“最终少调用模型”，而是“无变化子树不进入 语义树”。当前实现的 `recursive=True + changes` 仍会递归调度所有子目录，这是本阶段必须修掉的性能边界。
 
 示例：
 
@@ -1203,7 +1203,7 @@ repo/
 └── tests/            # unchanged subtree
 ```
 
-目标 DAG：
+目标 语义树：
 
 ```text
 FileSummary(src/a.py)
@@ -1219,8 +1219,8 @@ FileSummary(src/a.py)
 不得创建或进入：
 
 ```text
-docs 的 dir/file DAG 节点
-tests 的 dir/file DAG 节点
+docs 的 dir/file 语义树节点
+tests 的 dir/file 语义树节点
 utils 内部的任何节点
 b.py 的正文读取、LLM 或 embedding 节点
 ```
@@ -1233,9 +1233,9 @@ b.py   → 使用 plan entry 中的旧 L2 abstract
 utils  → 使用 plan entry 中的旧 L0 abstract
 ```
 
-当前目录的全部直接子项和所需旧摘要由 tree snapshot 的邻接表与各 child entry 的 `indexed_records` 提供；正常聚合不再执行 `ls(src)`，也不再查询向量库，更不允许递归进入 `utils`。目录真正执行时，DAG 在邻接表中的全部直接子项上调用现有 `deterministic_sample()`，只把采样结果交给 overview 模型；这不会要求 plan 包含未变化子目录的后代。若某个未变化直接子项缺少所需摘要，只为该直接子项动态补任务：文件补一个 FileSummary，目录可显式执行该目录修复或使当前任务失败并要求 reindex；不能无条件退化为扫描整个 root。只有 `UPDATE_FIELDS` 为保留未携带的 dense/sparse vector 时允许按稳定 ID 二次查询完整旧记录。
+当前目录的全部直接子项和所需旧摘要由 tree snapshot 的邻接表与各 child entry 的 `indexed_records` 提供；正常聚合不再执行 `ls(src)`，也不再查询向量库，更不允许递归进入 `utils`。目录真正执行时，语义树在邻接表中的全部直接子项上调用现有 `deterministic_sample()`，只把采样结果交给 overview 模型；这不会要求 plan 包含未变化子目录的后代。若某个未变化直接子项缺少所需摘要，只为该直接子项动态补任务：文件补一个 FileSummary，目录可显式执行该目录修复或使当前任务失败并要求 reindex；不能无条件退化为扫描整个 root。只有 `UPDATE_FIELDS` 为保留未携带的 dense/sparse vector 时允许按稳定 ID 二次查询完整旧记录。
 
-最小 DAG 编译规则：
+最小语义树 编译规则：
 
 1. `state=added/modified` 的文件创建文件摘要节点；`state=deleted` 的文件不读取正文。
 2. 从每个非 unchanged entry 推导其直接父目录，构造去重后的受影响目录集合。
@@ -1296,13 +1296,13 @@ add_resources 本身不依赖 content-write 的 coalesce 降级逻辑，因此�
 
 ### 18.6 memory 明确排除在本轮改造之外
 
-本轮不新增 `MemoryRefreshPlan`，不调整 `MemoryUpdater`，也不修改 `_process_memory_directory`、`use_hierarchical_aggregation` 或 memory reindex。原因是 memory 正常写入采用 schema/template 派生，而 add_resources 采用通用 LLM 目录 DAG；为了本轮 add_resources 解耦而统一二者，会扩大业务语义和测试矩阵。
+本轮不新增 `MemoryRefreshPlan`，不调整 `MemoryUpdater`，也不修改 `_process_memory_directory`、`use_hierarchical_aggregation` 或 memory reindex。原因是 memory 正常写入采用 schema/template 派生，而 add_resources 采用通用 LLM 目录 语义树；为了本轮 add_resources 解耦而统一二者，会扩大业务语义和测试矩阵。
 
-已确认的当前事实仅作为后续设计输入：正常 memory write/batch-write/delete 不走 memory 专用 Semantic 分支；memory reindex 显式选择通用 DAG；通用 `summarize(memory_uri)`、历史持久化消息或外部直接生产旧 `SemanticMsg` 仍可进入 `_process_memory_directory`。本轮必须保证这些旧路径在 `plan=None` 时行为完全不变。
+已确认的当前事实仅作为后续设计输入：正常 memory write/batch-write/delete 不走 memory 专用 Semantic 分支；memory reindex 显式选择通用 语义树；通用 `summarize(memory_uri)`、历史持久化消息或外部直接生产旧 `SemanticMsg` 仍可进入 `_process_memory_directory`。本轮必须保证这些旧路径在 `plan=None` 时行为完全不变。
 
 ### 18.7 执行结果与父目录传播
 
-首次入队前无法知道新 L0 是否真正变化，因此父目录 freshness 不能完全前移。DAG 执行返回：
+首次入队前无法知道新 L0 是否真正变化，因此父目录 freshness 不能完全前移。语义树执行返回：
 
 ```python
 @dataclass(frozen=True)
@@ -1362,7 +1362,7 @@ class EmbeddingOperation(str, Enum):
 | repair file | 生成摘要；旧摘要缺失时保守决定目录聚合 | `EMBED_AND_UPSERT` L2 |
 | deleted path | 不读正文，标记父目录结构变化 | 对已枚举旧记录发 `DELETE` |
 | structural replacement | 处理新 manifest 中的新类型，标记父目录结构变化 | 删除旧层级记录；新文件/目录按需 upsert |
-| orphan vector | 不进入语义 DAG | `DELETE` |
+| orphan vector | 不进入语义树 | `DELETE` |
 | unchanged | 不进入执行集合 | 无；若仅缺 MD5且正文已确认相同，可选 `UPDATE_FIELDS` |
 
 同一 `(account_id, uri, level)` 在一个 plan 中只能编译出一种最终操作；entry 派生删除与 `orphan_vector_deletes` 必须先按 record ID 去重，发现 `DELETE` 与 `UPDATE_FIELDS/EMBED_AND_UPSERT` 冲突时必须在入 EmbeddingQueue 前失败。由于本轮不实现 generation fencing，旧 plan 的异步 DELETE/UPDATE/UPSERT 晚于新请求到达时仍可能破坏新索引；这是第 8.2/16.3 节已记录的最终一致性风险，本轮按用户确认先接受，不能把 operation 统一误称为并发正确性修复。
@@ -1385,13 +1385,13 @@ class EmbeddingOperation(str, Enum):
 |---|---|---|
 | S1 | 新增 `SemanticPlan`、带状态 tree/index snapshot 模型与校验；`SemanticMsg` 增加可选 plan | 无 plan 的所有旧入口行为不变 |
 | S2 | 扩展现有 `EmbeddingMsg/Handler` 支持 `UPDATE_FIELDS/DELETE` | 旧消息默认 embed/upsert；新操作不调用模型 |
-| S3 | local 目录 add_resources 构造新 plan，消费端将 plan 映射到现有 DAG 参数 | local 行为等价，消息不再携带 artifact |
+| S3 | local 目录 add_resources 构造新 plan，消费端将 plan 映射到现有 语义树 参数 | local 行为等价，消息不再携带 artifact |
 | S4 | AGFS 目录 temp→target diff/apply 前移，复用现有 DiffPlan/ApplyResult | 新 add_resources consumer 不再同步文件树 |
-| S5 | 为带状态 tree snapshot 实现受影响路径最小 DAG | 增量不再访问无变化子树 |
+| S5 | 为带状态 tree snapshot 实现受影响路径最小语义树 | 增量不再访问无变化子树 |
 | S6 | 收敛 add_resources 新 plan 的 artifact 清理、锁 handoff、错误与观测 | 完成新链路生命周期 |
 | S7 | 运行 local/AGFS 正确性与性能 A/B | 满足访问计数和数据一致性验收 |
 
-每个阶段独立提交；S1/S2 先做兼容扩展，S4 文件同步前移与 S5 DAG 算法优化不得揉成同一个提交。S5 必须以访问计数证明裁剪生效，不能只用 embedding 数下降作为证据。write、batch-write、reindex、memory 的迁移另立后续方案，不作为这些阶段的前置或验收条件。
+每个阶段独立提交；S1/S2 先做兼容扩展，S4 文件同步前移与 S5 语义树 算法优化不得揉成同一个提交。S5 必须以访问计数证明裁剪生效，不能只用 embedding 数下降作为证据。write、batch-write、reindex、memory 的迁移另立后续方案，不作为这些阶段的前置或验收条件。
 
 ### 18.11 测试与验收
 
@@ -1401,7 +1401,7 @@ class EmbeddingOperation(str, Enum):
 - 同一测试验证新 consumer 可继续解析和执行没有 plan 的历史消息；新 plan 的回滚依赖受控排空，不要求旧 consumer 解释新 plan。
 - 向量 hydration 测试：DSL 覆盖全部 ID 时不调用 fetch；DSL 正常部分命中时只 fetch 缺失 ID；DSL 异常时不按 miss 继续；fallback 返回向量字段时进入 plan 前剔除；URI/level/tenant 不匹配时失败。
 - `tests/storage/test_embedding_queue_operations.py`：旧消息默认 embed/upsert；`UPDATE_FIELDS` 不调用模型且允许一次 get→merge→upsert；`DELETE` 按精确 ID 幂等删除；非法字段和同记录冲突拒绝。
-- `tests/storage/test_semantic_dag_incremental.py`：变化路径最小 DAG、未变化摘要复用、摘要不变停止传播、删除/目录替换。
+- `tests/storage/test_semantic_executor_incremental.py`：变化路径最小语义树、未变化摘要复用、摘要不变停止传播、删除/目录替换。
 - `tests/storage/test_semantic_processor_target_preexisting.py`：新 add_resources plan 不执行 temp→target sync，只接收正式 root；旧消息同步行为保留。
 - `tests/utils/test_local_artifact_incremental.py` 与 AGFS 对应集成测试：两种产物后端在入队前得到相同正式树和 changes。
 - diff apply 边界测试：新 plan 路径只修改正式文件树，不直接调用向量 delete/update；deleted/structural 的旧记录保存在 entry，纯 orphan 进入 `orphan_vector_deletes`，三者最终都由 Embedding handler 执行。
@@ -1409,7 +1409,7 @@ class EmbeddingOperation(str, Enum):
 - 解析完整性和入队失败测试：部分目录解析失败在 finalize/diff 前终止；代码仓库 artifact 部分写失败不产生可提交结果；plan 入队失败清理 artifact、释放锁并向上报错；文件/目录语义请求失败仅跳过对应节点。
 - 现有 write、batch-write、reindex、memory 定向回归：证明 `plan=None` 时参数、队列消息和结果不变；不新增这些入口的 plan 测试。
 
-必须覆盖的最小 DAG 用例：
+必须覆盖的最小语义树 用例：
 
 ```text
 repo/
@@ -1421,7 +1421,7 @@ repo/
 只修改 `changed/a.py` 时断言：
 
 - Semantic worker 不为发现拓扑调用 `tree/ls`，也不访问 `unchanged_a`、`unchanged_b`；拓扑和直接聚合输入由 plan 提供。
-- 不读取未变化子树正文，不为其创建 file/dir DAG 节点。
+- 不读取未变化子树正文，不为其创建 file/dir 语义树节点。
 - 正常目录聚合不查询向量库，直接使用 plan 中当前聚合目录直接子项的 L2/L0 abstract；只有 `UPDATE_FIELDS` 可产生一次按 ID 的旧记录读取。
 - 文件摘要未变化时只产生一个文件 L2 embedding，目录 LLM 和父目录任务均为 0。
 - 文件摘要变化时只聚合直接父目录；更高祖先由 freshness 结果决定。
@@ -1431,7 +1431,7 @@ repo/
 
 ### 18.12 SemanticPlan 实施后 40 文件收益验证
 
-在第 14.7 节相同的 frozen 40 文件、shared HTTP 输入、local parse output、本地向量库和远程 S3 环境上，完成 SemanticPlan、同步前移与最小 DAG 后重新执行 initial、no-op、edit-one。每轮仍包含相同的 5 秒 benchmark 等待，且正式代码不增加 shared 重试。
+在第 14.7 节相同的 frozen 40 文件、shared HTTP 输入、local parse output、本地向量库和远程 S3 环境上，完成 SemanticPlan、同步前移与最小语义树 后重新执行 initial、no-op、edit-one。每轮仍包含相同的 5 秒 benchmark 等待，且正式代码不增加 shared 重试。
 
 | 场景 | shared-only 基线 | SemanticPlan 优化 | 降幅 | 语义工作量 |
 |---|---:|---:|---:|---|
@@ -1439,7 +1439,7 @@ repo/
 | no-op | 77.07s | 11.21s | 85.5% | 不入 SemanticQueue；0 摘要、0 embedding |
 | edit-one | 75.02s | 12.20s | 83.7% | 1 文件摘要、1 目录摘要、1 embedding |
 
-edit-one 的 Semantic DAG 从 shared-only 基线 33.92s 降至 1.34s，下降 96.1%；EmbeddingQueue 新消息从 27 条降至 1 条。与上一版仅 local artifact + MD5 diff 的 edit-one（38.06s、Semantic DAG 27.07s、9 条 embedding）相比，最小 DAG 又将端到端时间降至 12.20s，并把目录遍历和未变化分支的向量工作收敛掉。
+edit-one 的 Semantic tree 从 shared-only 基线 33.92s 降至 1.34s，下降 96.1%；EmbeddingQueue 新消息从 27 条降至 1 条。与上一版仅 local artifact + MD5 diff 的 edit-one（38.06s、Semantic tree 27.07s、9 条 embedding）相比，最小语义树 又将端到端时间降至 12.20s，并把目录遍历和未变化分支的向量工作收敛掉。
 
 三轮均通过 40/40 正式文件、40/40 正文和 40/40 L2 校验，missing、unexpected、content mismatch 均为空，队列 error_count 为 0；no-op 前后 Semantic/Embedding processed 计数不增加。证据目录：`.scratch/ingest-profile/semantic-plan40-20260913-212633`。每个场景仍只有 1 个有效样本，数据用于功能和工作量收敛验证，不宣称 P95 或统计显著性。
 
@@ -1476,7 +1476,7 @@ edit-one 的 Semantic DAG 从 shared-only 基线 33.92s 降至 1.34s，下降 96
 | N/F/V 快照 | — | 0.043s | 0.046s |
 | diff apply / 正式树提交 | 首次全量提交 12.24s | 17.38s | 15.49s |
 | SemanticPlan 构造 | 0.001s | 0.001s | 0.002s |
-| Semantic DAG | 54.15s | 0s | 1.20s |
+| Semantic tree | 54.15s | 0s | 1.20s |
 | AGFS temp 清理 | 6.01s | 2.72s | 2.35s |
 | 端到端 | 100.88s | 48.82s | 43.56s |
 
@@ -1488,13 +1488,13 @@ edit-one 的 Semantic DAG 从 shared-only 基线 33.92s 降至 1.34s，下降 96
 | no-op / 图片 URI 规范化 | 1.02s | 0.008s | AGFS 需要远程列举/读取；local 为本地操作 |
 | no-op / N/F/V 快照 | 0.043s | 0.036s | 两者接近，快照查询不是主要瓶颈 |
 | no-op / diff apply | 17.38s | 0.00004s | AGFS artifact 缺 MD5 manifest，40 文件回退远程正文比较 |
-| no-op / Semantic DAG | 0s | 0s | 两者都识别为健康 no-op，不入 SemanticQueue |
+| no-op / Semantic tree | 0s | 0s | 两者都识别为健康 no-op，不入 SemanticQueue |
 | no-op / temp 清理 | 2.72s | 无远程清理 | AGFS 删除远程 temp 树 |
 | edit-one / 解析及产物写入 | 16.25s | 0.13s | 修改比例不影响 AGFS 全量 temp 上传 |
 | edit-one / 图片 URI 规范化 | 0.81s | 0.008s | 同上 |
 | edit-one / N/F/V 快照 | 0.046s | 0.036s | 两者接近 |
 | edit-one / diff apply | 15.49s | 0.067s | AGFS 仍先远程比较 40 个文件，local 按 manifest MD5 只提交变化文件 |
-| edit-one / Semantic DAG | 1.20s | 0.89s | 两者均执行相同最小 DAG，差异属于远程 I/O/运行波动 |
+| edit-one / Semantic tree | 1.20s | 0.89s | 两者均执行相同最小语义树，差异属于远程 I/O/运行波动 |
 | edit-one / temp 清理 | 2.35s | 无远程清理 | AGFS 删除远程 temp 树 |
 
 #### 队列工作量和正确性
@@ -1505,7 +1505,7 @@ edit-one 的 Semantic DAG 从 shared-only 基线 33.92s 降至 1.34s，下降 96
 | no-op | 0 | 0 | 0 | 0 | 两组均 40/40/40 |
 | edit-one | 1 | 1 | 1 | 1 | 两组均 40/40/40 |
 
-队列计数只统计当前资源请求归属的根消息；initial 的阶段探针观察到 56 次 embedding handler/upsert，其中另有父目录刷新产生的 2 条目录向量。两种模式的语义工作量一致：initial 都是 40 个文件节点、8 个目录节点；no-op 均没有语义 DAG；edit-one 均为 1 个文件节点和 1 个快速目录判断，实际目录 LLM 为 0。
+队列计数只统计当前资源请求归属的根消息；initial 的阶段探针观察到 56 次 embedding handler/upsert，其中另有父目录刷新产生的 2 条目录向量。两种模式的语义工作量一致：initial 都是 40 个文件节点、8 个目录节点；no-op 均没有语义树；edit-one 均为 1 个文件节点和 1 个快速目录判断，实际目录 LLM 为 0。
 
 六轮 API 均为 `success`，文件和正文校验均为 40/40，L2 索引均为 40/40；missing files、unexpected files、content mismatches、missing vectors、Semantic error_count 和 Embedding error_count 均为 0。跨模式 edit-one 终态 validation 完全相同。本次没有保存全量 L0/L1 正文及 dense vector 快照，因此不宣称两次独立模型生成的目录摘要或浮点向量字节级一致。
 
@@ -1546,7 +1546,7 @@ AGFS 剩余瓶颈已经定位：当前 `CodeRepositoryParser` 的 AGFS 旧写入
 
 以下均使用 `wall_union_s`。阶段存在嵌套和并行，不能逐列求和还原端到端时间。`提交/diff` 对 initial 表示首次正式树提交，对增量场景表示目标快照与 diff apply；优化前增量场景对应旧 `sync_tree`。
 
-| 模式 / 场景 | 解析及产物写入 | 图片 URI 规范化 | 提交 / diff | Semantic DAG |
+| 模式 / 场景 | 解析及产物写入 | 图片 URI 规范化 | 提交 / diff | Semantic tree |
 |---|---:|---:|---:|---:|
 | 基线 / initial | 147.56s | — | 141.76s | 84.74s |
 | 基线 / no-op | 146.84s | 0.27s | 190.06s | 77.32s |
@@ -1563,7 +1563,7 @@ AGFS 剩余瓶颈已经定位：当前 `CodeRepositoryParser` 的 AGFS 旧写入
 
 所有场景的 shared 上传和 worker 物化都小于 0.8 秒；shared 已经消除了旧本地入口的重复 SOURCE 暂存成本，不再是主瓶颈。当前 AGFS 的主要剩余成本是：每次仍把 642 个解析产物写入远程 temp，约 139–145 秒；增量 diff 又因 AGFS 产物没有预计算 MD5 manifest 而回退读取和比较远程正文，约 173–178 秒。SemanticPlan 已经消除了 no-op 的全部语义工作，但无法消除这两段远程文件 I/O。
 
-local 模式在解析时写本地 artifact 并计算最终 bytes 的 MD5；no-op 的 diff apply 为 0.00002 秒，edit-one 为 0.039 秒，只在确定有变化后才上传正式文件。edit-10% 的 4.15 秒 diff apply 对应 64 个变化文件的正式上传。initial 仍需把全量正式文件提交到 S3，因此 persist 为 42.25 秒；其 133.89 秒端到端时间中，Semantic DAG 的 81.25 秒已成为主要成本。
+local 模式在解析时写本地 artifact 并计算最终 bytes 的 MD5；no-op 的 diff apply 为 0.00002 秒，edit-one 为 0.039 秒，只在确定有变化后才上传正式文件。edit-10% 的 4.15 秒 diff apply 对应 64 个变化文件的正式上传。initial 仍需把全量正式文件提交到 S3，因此 persist 为 42.25 秒；其 133.89 秒端到端时间中，Semantic tree 的 81.25 秒已成为主要成本。
 
 #### 语义与向量工作量
 
@@ -1574,7 +1574,7 @@ local 模式在解析时写本地 artifact 并计算最终 bytes 的 MD5；no-op
 | edit-one | 642 / 77 / 51 / 418 | 1 / 1 / 0 / 1 | 1 / 1 / 0 / 1 |
 | edit-10% | 641 / 77 / 54 / 462 | 64 / 11 / 11 / 86 | 64 / 11 / 11 / 86 |
 
-这里的 overview 使用 `generate_overview.calls`，代表实际目录 LLM 调用；目录节点只表示 DAG 访问或快速判断，不等于一定调用 LLM。edit-one 的文件稳定摘要不变，因此不重新生成目录 overview；但本测试通过 ZIP 输入，`is_code_repo=False`，L2 embedding 默认仍以正文为输入，所以修改文件仍产生 1 次 embedding，而不是代码仓库摘要模式下的纯 `UPDATE_FIELDS`。AGFS 与 local 的语义工作量完全一致，说明 parse output backend 只改变存储和 diff 成本，没有改变 SemanticPlan 的裁剪结果。
+这里的 overview 使用 `generate_overview.calls`，代表实际目录 LLM 调用；目录节点只表示 语义树 访问或快速判断，不等于一定调用 LLM。edit-one 的文件稳定摘要不变，因此不重新生成目录 overview；但本测试通过 ZIP 输入，`is_code_repo=False`，L2 embedding 默认仍以正文为输入，所以修改文件仍产生 1 次 embedding，而不是代码仓库摘要模式下的纯 `UPDATE_FIELDS`。AGFS 与 local 的语义工作量完全一致，说明 parse output backend 只改变存储和 diff 成本，没有改变 SemanticPlan 的裁剪结果。
 
 #### 进程树内存与本地磁盘峰值
 
@@ -1615,10 +1615,10 @@ local 模式没有出现内存峰值回退：其最大 RSS 为 331.59 MiB，低�
 
 #### 结论
 
-1. SemanticPlan/最小 DAG 本身有效：即使保留 AGFS parse output，no-op 和 edit-one 也分别比旧基线快 20.8% 和 23.2%，语义工作量从全树收敛为 0 和 1 个文件节点。
+1. SemanticPlan/最小语义树 本身有效：即使保留 AGFS parse output，no-op 和 edit-one 也分别比旧基线快 20.8% 和 23.2%，语义工作量从全树收敛为 0 和 1 个文件节点。
 2. 最大收益来自 local parse output 与延迟上传：no-op 为 10.76 秒、edit-one 为 9.79 秒，相对基线分别下降 97.5% 和 97.8%；相对同一当前代码的 AGFS 模式也下降 96.9% 和 97.1%。
 3. 首次导入仍需全量语义和正式 S3 提交。SemanticPlan + AGFS 与基线基本持平，local 通过去掉 AGFS temp 全量写入将端到端从 387.68 秒降到 133.89 秒，下降 65.5%。
-4. 10% 修改时模型计算重新成为主成本：local 的文件系统阶段约 6.5 秒，Semantic DAG 为 104.07 秒，最终 130.44 秒；因此收益从 no-op/edit-one 的约 40–45 倍回落，但相对当前 AGFS 仍快 3.44 倍。
+4. 10% 修改时模型计算重新成为主成本：local 的文件系统阶段约 6.5 秒，Semantic tree 为 104.07 秒，最终 130.44 秒；因此收益从 no-op/edit-one 的约 40–45 倍回落，但相对当前 AGFS 仍快 3.44 倍。
 5. 资源代价可控。local 没有提高绝对 RSS 峰值，本地磁盘最大峰值也低于两种 AGFS 路径；新增本地 artifact 的空间成本没有抵消延迟收益。
 6. 若还要优化 AGFS 模式，应优先让 AGFS parse output 在写最终 bytes 时生成 MD5 manifest，避免增量 diff 的 642 文件远程正文回退比较；但远程 temp 全量上传本身仍会保留约 140 秒成本，无法达到 local 模式的量级。
 
@@ -1652,11 +1652,11 @@ benchmark runner 和测试仍只保留在本地工作区，不纳入正式提交
 | edit-one | 219.084 / 233.918 / 239.519s | 233.918s | 1575.083 / 1696.052 / 1738.261s | 1696.052s | 7.25x，减少 86.2% |
 | edit-10% | 373.421 / 395.633 / 407.972s | 395.633s | 1713.327 / 1862.750 / 2129.230s | 1862.750s | 4.71x，减少 78.8% |
 
-no-op 的 local 中位数没有被第二轮 355.679 秒异常样本拉高，因为另外两轮分别为 178.218 秒和 177.027 秒。即使保留该异常样本而不挑选重跑，三轮中位数仍比 main 快 9.28 倍。edit-one 和 edit-10% 的收益来自 local artifact、基于 manifest MD5 的增量提交和最小 Semantic DAG 的共同作用；initial 仍需全量正式树提交和全量语义生成，因此加速比低于增量场景。
+no-op 的 local 中位数没有被第二轮 355.679 秒异常样本拉高，因为另外两轮分别为 178.218 秒和 177.027 秒。即使保留该异常样本而不挑选重跑，三轮中位数仍比 main 快 9.28 倍。edit-one 和 edit-10% 的收益来自 local artifact、基于 manifest MD5 的增量提交和最小 Semantic tree 的共同作用；initial 仍需全量正式树提交和全量语义生成，因此加速比低于增量场景。
 
 #### 服务端主要阶段中位数
 
-| 模式 / 场景 | 解析 | 正式树提交或快照/同步 | SemanticPlan | Semantic DAG | file summary 调用 | overview 调用 | embedding/upsert 调用 |
+| 模式 / 场景 | 解析 | 正式树提交或快照/同步 | SemanticPlan | Semantic tree | file summary 调用 | overview 调用 | embedding/upsert 调用 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | final local / initial | 42.776s | local persist 729.684s | 0.030s | 355.074s | 867 | 174 | 1215 / 1215 |
 | final local / no-op | 43.699s | snapshot 34.860s | 0.030s | 0s | 0 | 0 | 0 / 0 |
@@ -1667,7 +1667,7 @@ no-op 的 local 中位数没有被第二轮 355.679 秒异常样本拉高，因�
 | main / edit-one | 1142.379s | sync tree 157.336s | — | 309.905s | 867 | 90 | 734 / 734 |
 | main / edit-10% | 1120.365s | sync tree 341.007s | — | 307.640s | 866 | 105 | 797 / 797 |
 
-这里的调用数同样取三轮中位数；final local 第二轮 no-op 的异常工作量在下一节单独展开。正常 local no-op 不进入 Semantic DAG，edit-one 只重新处理一个文件；edit-10% 每轮都准确产生 87 次 file summary，而 main 在所有增量场景中仍近似全量解析和重做语义工作。
+这里的调用数同样取三轮中位数；final local 第二轮 no-op 的异常工作量在下一节单独展开。正常 local no-op 不进入 Semantic tree，edit-one 只重新处理一个文件；edit-10% 每轮都准确产生 87 次 file summary，而 main 在所有增量场景中仍近似全量解析和重做语义工作。
 
 #### CPU、RSS 与本地磁盘
 
@@ -1712,7 +1712,7 @@ N_files=867 F_files=867 V_vectors=862
 plan_unchanged=862 plan_repair=5 vector_missing=5
 ```
 
-这 5 个 repair 触发了 5 次 file summary、18 个目录节点、16 次 overview LLM，以及 31 次 embedding/upsert。对应阶段为 SemanticPlan 5.830 秒、Semantic DAG 167.481 秒，最终把端到端耗时推高到 355.679 秒。该轮结束后的强校验仍为 867/867，MD5 missing 和 mismatch 都为 0；随后 edit-one 的同类范围扫描也恢复为 867。
+这 5 个 repair 触发了 5 次 file summary、18 个目录节点、16 次 overview LLM，以及 31 次 embedding/upsert。对应阶段为 SemanticPlan 5.830 秒、Semantic tree 167.481 秒，最终把端到端耗时推高到 355.679 秒。该轮结束后的强校验仍为 867/867，MD5 missing 和 mismatch 都为 0；随后 edit-one 的同类范围扫描也恢复为 867。
 
 现有证据说明这是向量库两个读取路径的短暂可见性差异：逐 ID `get` 已经可见 867 条，但 URI/level 范围索引在该次扫描中只返回 862 条。当前 strict count 与范围扫描仍依赖同一份范围结果，无法提前识别这 5 条“已可 get、暂不可 scan”的记录，所以实现选择了保守 repair，而不是错误地当作 no-op。它造成额外耗时，但没有产生错误 MD5 或错误终态。后续若要稳定 no-op 延迟，应让缺项在 repair 前按稳定 ID 做二次 `get`，或为范围索引增加可见性屏障/有界重试。
 

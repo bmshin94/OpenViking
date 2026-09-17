@@ -58,10 +58,11 @@ class AgfsResourceTarget:
     async def read_file(self, rel_path: str) -> bytes:
         return await self._viking_fs.read_file_bytes(self._resolve(rel_path), ctx=self._ctx)
 
-    async def delete_file(self, rel_path: str) -> None:
+    async def delete_path(self, rel_path: str, *, is_dir: bool) -> None:
+        """Delete one planned path under the already-held resource tree lease."""
         await self._viking_fs.remove_files(
             self._resolve(rel_path),
-            recursive=True,
+            recursive=is_dir,
             ctx=self._ctx,
             lease_ref=self._lease_ref,
         )

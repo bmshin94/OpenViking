@@ -43,6 +43,7 @@ from openviking.storage.resource_rnfv import (
     VectorIndexSnapshot,
     VectorRecordSnapshot,
 )
+from openviking.utils.log_correlation import log_correlation
 
 logger = logging.getLogger(__name__)
 
@@ -285,9 +286,10 @@ async def resolve_resource_diff(
     content_counts = Counter(entry.content_state.value for entry in resolved.entries.values())
     index_counts = Counter(entry.index_state.value for entry in resolved.entries.values())
     logger.info(
-        "[ResourceDiffResult] target=%s n_entries=%d f_entries=%d v_records=%d "
+        "[ResourceDiffResult] %s target=%s n_entries=%d f_entries=%d v_records=%d "
         "content_states=%s index_states=%s md5_fast_path=%d body_compared=%d "
         "new_files_hashed=%d",
+        log_correlation(),
         snapshot.request.target_uri,
         len(new),
         len(formal),

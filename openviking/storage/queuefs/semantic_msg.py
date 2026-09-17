@@ -38,7 +38,7 @@ class SemanticMsg:
                    enqueue them for processing (bottom-up order).
                    When False, only the specified directory will be processed.
         use_hierarchical_aggregation: Route memory directories through the
-                   shared directory DAG instead of the specialized flat memory
+                   shared semantic tree instead of the specialized flat memory
                    update path.
         propagate_to_parent: Whether a completed directory refresh may enqueue
                    a freshness refresh for its parent.
@@ -76,7 +76,7 @@ class SemanticMsg:
     propagate_to_parent: bool = True
     copy_source_uri: str = ""
     # Per-file md5 of final stored bytes, keyed by target URI. Supplied by the
-    # local incremental apply so the DAG's re-vectorization writes a fresh
+    # local incremental apply so the tree executor's re-vectorization writes a fresh
     # fingerprint; empty for all other flows.
     file_md5s: Dict[str, str] = field(default_factory=dict)
     artifact_ref: Optional[Dict[str, Any]] = None

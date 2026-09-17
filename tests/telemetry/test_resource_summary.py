@@ -2,7 +2,7 @@
 from openviking.telemetry.operation import OperationTelemetry
 
 
-def test_record_resource_queue_metrics_collects_queue_and_dag_stats(monkeypatch):
+def test_record_resource_queue_metrics_collects_queue_and_tree_stats(monkeypatch):
     from openviking.telemetry.resource_summary import record_resource_queue_metrics
 
     telemetry = OperationTelemetry(operation="resources.add_resource", enabled=True)
@@ -25,7 +25,7 @@ def test_record_resource_queue_metrics_collects_queue_and_dag_stats(monkeypatch)
                 "embedding": {"queue_wait_ms": 8.0, "execute_ms": 20.0},
             }
 
-    class _DagStats:
+    class _SemanticTreeStats:
         total_nodes = 9
         done_nodes = 8
         pending_nodes = 1
@@ -40,8 +40,8 @@ def test_record_resource_queue_metrics_collects_queue_and_dag_stats(monkeypatch)
         lambda _tid: _EmbeddingStats(),
     )
     monkeypatch.setattr(
-        "openviking.telemetry.resource_summary._consume_semantic_dag_stats",
-        lambda _tid, _uri: _DagStats(),
+        "openviking.telemetry.resource_summary._consume_semantic_tree_stats",
+        lambda _tid, _uri: _SemanticTreeStats(),
     )
     monkeypatch.setattr(
         "openviking.telemetry.resource_summary.get_request_wait_tracker",

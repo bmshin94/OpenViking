@@ -36,7 +36,7 @@ R/N/F/V -> ResourceDiffResult -> ContextUpdatePlan
 - `F` 是当前正式资源文件树。
 - `V` 是当前向量库索引快照。
 
-上游根据四类输入先得到最终 diff 事实，再生成 `ContextUpdatePlan`。该计划把正式内容树操作、语义 DAG 操作和直接索引操作分开表达：内容树操作在请求同步阶段执行；纯索引操作直接进入 embedding queue；依赖语义结果的索引操作绑定到 semantic tree entry，由 semantic DAG 完成后释放。这样可以表达“文件未变但 tags 变化”“文件存在但索引缺失”“索引存在但文件缺失”等旧接口难以准确表达的情况。
+上游根据四类输入先得到最终 diff 事实，再生成 `ContextUpdatePlan`。该计划把正式内容树操作、语义树操作和直接索引操作分开表达：内容树操作在请求同步阶段执行；纯索引操作直接进入 embedding queue；依赖语义结果的索引操作绑定到 semantic tree entry，由 semantic tree 完成后释放。这样可以表达“文件未变但 tags 变化”“文件存在但索引缺失”“索引存在但文件缺失”等旧接口难以准确表达的情况。
 
 ### 1.3 收益与适用场景
 
@@ -73,7 +73,7 @@ R/N/F/V -> ResourceDiffResult -> ContextUpdatePlan
 | 从远程物化到本地 | 55.68s | 57.57s |
 | 解析及再次上传临时目录 | 100.65s | 99.64s |
 | 目标树同步、逐文件比较 | 124.04s | 112.07s |
-| 语义处理 DAG | 68.02s | 59.37s |
+| 语义树处理 | 68.02s | 59.37s |
 | 清理 | 10.20s | 12.88s |
 | 文件摘要生成数 | 223 | 125 |
 | 旧摘要复用数 | 0 | 222 |
@@ -90,7 +90,7 @@ R/N/F/V -> ResourceDiffResult -> ContextUpdatePlan
 
 - 输入未变，但 source、全量 parser、完整远程临时树写入、目标树读取和逐路径比较仍执行，说明前置链路仍接近全量，存在明显的重复远程 IO。
 - 目标树同步还包含目录列举、stat、正文读取和差异判断；本轮还因产物缺失触发了删除判断，因此不能视为健康 no-op 的纯比较成本。
-- 语义 DAG 的主要耗时来自递归节点调度、当前内容检查、旧摘要读取、部分摘要/目录生成和 embedding；向量 upsert 不是主要瓶颈。
+- 语义树 的主要耗时来自递归节点调度、当前内容检查、旧摘要读取、部分摘要/目录生成和 embedding；向量 upsert 不是主要瓶颈。
 - 旧逻辑依赖生成式 `.overview.md` 反向解析文件摘要，文件缺失、名称或格式变化都可能影响复用，使相同内容的 no-op 语义工作量不稳定。
 - 清理仍处理完整远程临时产物，成本与输入规模相关。
 
@@ -102,7 +102,7 @@ R/N/F/V -> ResourceDiffResult -> ContextUpdatePlan
 
 **一是性能问题。**
 
-- no-op 导入仍可能重复 source 处理、解析产物写入、目标文件读取、语义 DAG 和 embedding。
+- no-op 导入仍可能重复 source 处理、解析产物写入、目标文件读取、语义树 和 embedding。
 - diff 决策发生太晚，很多高成本存储操作已经完成。
 - 小文件修改可能触发过大的语义和向量处理范围。
 - AGFS 解析产物如果没有预计算内容指纹，增量 diff 会回退到远程正文比较。
@@ -126,7 +126,7 @@ R/N/F/V -> ResourceDiffResult -> ContextUpdatePlan
 | 解析产物、目标树扫描或同步不完整 | 缺失路径可能被误判为 deleted。 |
 | 目录聚合需要旧子摘要 | 只从文件树重建状态可能得到不完整或过期的目录摘要。 |
 
-这些问题说明旧方案的增量判断、资源同步、语义 DAG 和向量库状态之间缺少统一的计划边界；后文分别围绕性能优化和接口范式改造展开。
+这些问题说明旧方案的增量判断、资源同步、语义树 和向量库状态之间缺少统一的计划边界；后文分别围绕性能优化和接口范式改造展开。
 
 ## 3. 优化思路与总体设计
 
@@ -141,10 +141,10 @@ R/N/F/V -> ResourceDiffResult -> ContextUpdatePlan
 
 这些方向主要针对文件数量较多的首次导入、no-op 和小比例修改。首次导入仍需要全量写正式资源；优化的是不必要的远程临时中转。
 
-### 3.2 针对 DAG 抽象不足的优化思路
+### 3.2 针对语义树抽象不足的优化思路
 
 - 将资源文件同步、索引差异和请求标量变化在进入 semantic queue 前整理成明确的 `ResourceDiffResult` 和 `ContextUpdatePlan`。
-- 将正式内容树修改表示成 `ContentTreeAction`，将语义 DAG 需要的变化文件、必要父目录、旧摘要和旧索引标量整理成 `SemanticPlan`。
+- 将正式内容树修改表示成 `ContentTreeAction`，将语义树 需要的变化文件、必要父目录、旧摘要和旧索引标量整理成 `SemanticPlan`。
 - 将完全不依赖语义结果的索引操作表示成 direct `IndexAction`，直接进入 embedding queue；依赖语义结果的索引操作放在语义节点的 `IndexSlot` 中。
 - unchanged 文件不作为需要重新摘要的任务，但在父目录聚合需要时保留其旧 abstract 作为输入。
 - 将 embedding 队列抽象成明确的 embed/upsert、update_fields、delete 操作，让内容变化、标量变化和索引删除不再混在同一个隐式流程里。
@@ -167,8 +167,8 @@ RNFV 先生成事实状态，再映射成三类行为。状态和行为需要分
 | --- | --- | --- | --- |
 | diff 事实 | `ContentState`、`IndexState` | N/F/V 的比较结果 | 请求同步阶段，只用于构造计划。 |
 | 文件行为 | `ContentTreeAction` | 正式 AGFS 内容树 | 请求同步阶段，必须先于异步队列完成。 |
-| 语义行为 | `SemanticAction` | 文件摘要、目录 overview/abstract、最小 DAG | semantic queue。 |
-| 向量行为 | `IndexAction`、`IndexSlot` | L0/L1/L2 向量记录和标量字段 | direct `IndexAction` 直接进入 embedding queue；`IndexSlot` 由 semantic DAG 根据语义结果释放。 |
+| 语义行为 | `SemanticAction` | 文件摘要、目录 overview/abstract、最小语义树 | semantic queue。 |
+| 向量行为 | `IndexAction`、`IndexSlot` | L0/L1/L2 向量记录和标量字段 | direct `IndexAction` 直接进入 embedding queue；`IndexSlot` 由 semantic tree 根据语义结果释放。 |
 
 典型映射如下：
 
@@ -217,7 +217,7 @@ no-op 的定义必须覆盖所有相关维度：
   -> 分流异步派生行为：
        direct IndexAction -> embedding queue
        SemanticPlan       -> semantic queue
-                            -> semantic DAG 释放依赖语义结果的 IndexSlot
+                            -> semantic tree 释放依赖语义结果的 IndexSlot
                             -> embedding queue
   -> 清理本次 source / parser 临时产物
 ```
@@ -238,7 +238,7 @@ no-op 的定义必须覆盖所有相关维度：
 
 - parser 只产出解析 artifact 和 manifest，不判断增量行为。
 - resource processor 读取 R/N/F/V，生成 `ResourceDiffResult` 和 `ContextUpdatePlan`，并同步执行 `ContentTreeAction`。
-- semantic processor 只消费 `SemanticPlan`，按显式 `SemanticAction` 执行最小 DAG，不再通过同步临时树重新发现资源 diff。
+- semantic processor 只消费 `SemanticPlan`，按显式 `SemanticAction` 执行最小语义树，不再通过同步临时树重新发现资源 diff。
 - embedding processor 执行明确的 `IndexAction`：embed/upsert、update fields 或 delete。
 
 这样 planning 和 execution 分离。no-op 也变得可观测：如果 `ContextUpdatePlan` 没有 `content_tree_actions`、没有 `semantic_plan`、没有 `direct_index_actions`，就不应该入 semantic 或 embedding 队列。
@@ -254,7 +254,7 @@ no-op 的定义必须覆盖所有相关维度：
 | `ResourceDiffResult` | 描述每个路径的最终内容状态和索引状态，不包含待执行动作。 |
 | `ContextUpdatePlan` | 一次 add_resources 的最终执行计划，包含内容树动作、语义计划和直接索引动作。 |
 | `ContentTreeAction` | 同步修改正式内容树的动作。 |
-| `SemanticPlan` | 描述 semantic DAG 需要执行的最小树、语义动作和节点级索引槽。 |
+| `SemanticPlan` | 描述 semantic tree 需要执行的最小树、语义动作和节点级索引槽。 |
 | `IndexAction` | 向量队列执行的 `embed_and_upsert`、`update_fields`、`delete`。 |
 
 local parse output 的关键边界可以简化为：
@@ -419,7 +419,7 @@ R/N/F/V Snapshot 是生成最终 diff 事实前的四类输入视图。它们把
 V 快照按用途分阶段读取，不预加载 dense vector：
 
 - `ResourceDiffResult` 生成前，按目标目录范围读取轻量 inventory，主要包含 record id、URI、level 和 MD5，用来判断内容是否变化、索引是否缺失以及是否存在孤儿向量。
-- `SemanticPlan` 裁剪后，只对 DAG 需要依赖的 record id 回填 abstract、tags/search_tags、ACL/owner 等标量字段，用于复用旧摘要和继承业务元数据。
+- `SemanticPlan` 裁剪后，只对 语义树需要依赖的 record id 回填 abstract、tags/search_tags、ACL/owner 等标量字段，用于复用旧摘要和继承业务元数据。
 - 纯标量更新真正写入向量库时，如果底层 backend 需要原向量或完整记录，再由 embedding/vector 执行阶段按 record id 读取一次。
 
 不在 diff 阶段预加载 dense vector 是有意取舍：大目录下每条向量都可能很大，提前把向量数组放进 `ResourceDiffResult`、`ContextUpdatePlan` 或队列消息，会显著增加内存占用和序列化成本。
@@ -581,7 +581,7 @@ class ContentTreeAction:
 
 **定义**
 
-`SemanticPlan` 是进入 semantic queue 的可序列化计划。它只描述语义 DAG 的最小闭包和依赖语义结果的索引行为；纯向量删除、纯标量更新不进入 `SemanticPlan`。
+`SemanticPlan` 是进入 semantic queue 的可序列化计划。它只描述语义树 的最小闭包和依赖语义结果的索引行为；纯向量删除、纯标量更新不进入 `SemanticPlan`。
 
 ```python
 class SemanticAction(str, Enum):
@@ -648,7 +648,7 @@ class SemanticPlan:
 
 | `SemanticAction` | 行为 |
 | --- | --- |
-| `REUSE` | 不调用模型，从 `IndexSlot.existing_fields["abstract"]` 读取旧摘要作为 DAG 输入。 |
+| `REUSE` | 不调用模型，从 `IndexSlot.existing_fields["abstract"]` 读取旧摘要作为语义树输入。 |
 | `GENERATE` | 对文件正文生成新摘要。 |
 | `AGGREGATE` | 等待直接子项摘要就绪后生成目录 overview/abstract。 |
 
@@ -701,7 +701,7 @@ class IndexAction:
 - 一个请求内同一 `record_id` 不应同时出现互相冲突的动作；执行器发现冲突应视为 plan builder bug。
 - 文件提交成功但向量更新失败时，系统可能保留文件/向量不一致。本方案接受这个取舍，不承诺任意一次后续导入都能自动发现并修复；需要通过显式 reindex/repair 恢复。特别是 N 与 V 的 MD5 相同但 F 正文不同的组合，为避免 no-op 再读取远程正文，本方案仍按 `UNCHANGED` 处理。
 
-### 5.10 最小 DAG 闭包与执行过程
+### 5.10 最小语义树 闭包与执行过程
 
 假设完整正式树如下，本次请求有三类变化：`src/api/router.py` 修改，`docs/guide.md` 删除，`tests/unit/test_api.py` 新增；`src/utils`、`examples` 和 `tests/integration` 没有任何变化。
 
@@ -761,7 +761,7 @@ repo/                    AGGREGATE
 5. 已删除节点不进入新的语义树。它只影响父目录成员集合，并通过 direct `IndexAction.delete` 清理旧索引。
 6. 如果某个 `REUSE` 节点缺少可用旧 abstract，plan builder 不能把空摘要当成依赖输入；应把该节点提升为 `GENERATE` 或 `AGGREGATE`，或者显式失败并要求 reindex。
 
-DAG 执行流程：
+语义树执行流程：
 
 1. Semantic worker 反序列化 `SemanticPlan` 后，只根据 `tree.entries` 构造内存邻接表，不重新 `ls/tree` 扫描完整资源树。
 2. `REUSE` 节点初始化为已完成，摘要来自对应 `IndexSlot.existing_fields["abstract"]`。
@@ -771,7 +771,7 @@ DAG 执行流程：
 6. 语义节点失败时，依赖该节点新语义结果的 `IndexSlot` 不入队。父目录若能使用旧摘要降级，则继续；没有可用摘要时，该输入应被明确忽略或使当前聚合失败，不能静默使用空摘要。
 7. 父目录传播仍使用现有 freshness 机制。当前资源内部由最小闭包执行；是否继续刷新资源外部父目录，由目录摘要是否变化和 freshness 策略共同决定。
 
-这套执行方式保留 DAG 的自底向上依赖关系，但把“访问哪些节点”和“每个节点做什么”前移到 `SemanticPlan`。Semantic worker 不再根据 `added/modified/deleted` 自行推断业务行为，也不再递归访问无关子树。
+这套执行方式保留 语义树的自底向上依赖关系，但把“访问哪些节点”和“每个节点做什么”前移到 `SemanticPlan`。Semantic worker 不再根据 `added/modified/deleted` 自行推断业务行为，也不再递归访问无关子树。
 
 ### 5.11 ContextUpdatePlan 示例
 
@@ -972,6 +972,27 @@ DAG 执行流程：
 
 关键运营信号不只是 wall time。更确定的信号是工作量：健康 no-op 应产生 0 个 semantic 和 embedding 工作项。
 
+### 7.1 日志关联字段
+
+一次 `add_resources` 及其后代队列任务统一使用三类关联字段：
+
+- `task_id`：请求级主关联键。AddResource、Semantic 和 Embedding 队列消息通过任务中间件继承同一个值，排查整条链路时优先使用。
+- `telemetry_id`：本次操作的指标和 trace 关联键。未开启请求 telemetry 时仍会保留内部 ID。
+- `message_id`：当前 QueueFS 消息的局部标识。同一个 `task_id` 可以对应一个 semantic message 和多条 embedding message。
+
+关键汇总日志显式输出这些字段，不依赖部署环境的日志 formatter。例如：
+
+```text
+[AddResourceStarted] task_id=task-123 telemetry_id=tm-456 message_id=source-1 root=viking://resources/repo phase=source
+[RNFVSnapshot] task_id=task-123 telemetry_id=tm-456 target=viking://resources/repo ...
+[ContextUpdatePlan] task_id=task-123 telemetry_id=tm-456 root=viking://resources/repo ...
+[SemanticPlanExecution] task_id=task-123 telemetry_id=tm-456 message_id=semantic-1 root=viking://resources/repo ...
+Processing embedding message: task_id=task-123 telemetry_id=tm-456 message_id=embedding-1 uri=viking://resources/repo/a.py operation=embed_and_upsert
+[AddResourceCompleted] task_id=task-123 telemetry_id=tm-456 message_id=source-1 root=viking://resources/repo ...
+```
+
+生产环境可按 `task_id` 检索一次导入的完整链路，再按 `message_id` 定位某条 semantic/embedding 消息的重试和失败。
+
 ## 8. 正确性验证
 
 必须覆盖的场景：
@@ -1016,7 +1037,7 @@ DAG 执行流程：
 指标：
 
 - 端到端耗时。
-- 阶段耗时：source、parse、artifact persist、diff/apply、semantic DAG、embedding、cleanup。
+- 阶段耗时：source、parse、artifact persist、diff/apply、semantic tree、embedding、cleanup。
 - 工作量：文件数、目录数、semantic task、embedding task、vector upsert/update/delete。
 - 资源成本：RSS 峰值和本地磁盘峰值。
 - 正确性 diff：missing/unexpected files、content mismatch、missing vectors、MD5 mismatch。
@@ -1088,7 +1109,7 @@ DAG 执行流程：
 
 服务端主要阶段中位数：
 
-| 模式 / 场景 | 解析 | 正式树提交或快照/同步 | SemanticPlan | Semantic DAG | file summary | overview | embedding/upsert |
+| 模式 / 场景 | 解析 | 正式树提交或快照/同步 | SemanticPlan | Semantic tree | file summary | overview | embedding/upsert |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | final local / initial | 42.776s | local artifact -> 正式 AGFS 729.684s | 0.030s | 355.074s | 867 | 174 | 1215 / 1215 |
 | final local / no-op | 43.699s | snapshot 34.860s | 0.030s | 0s | 0 | 0 | 0 / 0 |
@@ -1148,7 +1169,7 @@ main 的失败表现为偶发缺少 1 到 2 个正式文件及其 L2，不是“
 - 向量库快照性能：prefix 或 DSL scan 必须分页完整。
 - 清理：local artifact 清理失败不能导致磁盘无限增长。
 - Embedding 消息协议：当前仍依赖 `context_data` 承载部分内部协议，后续应拆成显式字段。
-- 大修改行为：影响目录很多时，最小 DAG 合理退化到接近全量成本。
+- 大修改行为：影响目录很多时，最小语义树 合理退化到接近全量成本。
 
 ## 11. 发布与回滚
 

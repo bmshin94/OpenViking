@@ -1297,7 +1297,7 @@ async def test_resource_write_anchors_nested_file_to_direct_parent(
 ):
     """A resource content write anchors the semantic refresh at the written file's
     direct parent directory (anchor_to_parent=True), so the changed file is a direct
-    child of the DAG run root: its own L2 vector and the parent's L0/L1 are generated
+    child of the semantic-tree root: its own L2 vector and the parent's L0/L1 are generated
     from a single-directory run instead of a recursive walk of the whole project subtree.
     set_tags keeps the project-root collapse (the default), which the derived
     ``.abstract.md`` sidecar mapping relies on."""

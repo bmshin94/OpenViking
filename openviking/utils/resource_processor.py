@@ -36,6 +36,7 @@ from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.embedding_utils import index_resource, vectorize_file
 from openviking.utils.ingest_options import IngestOptions
+from openviking.utils.log_correlation import log_correlation
 from openviking.utils.summarizer import Summarizer
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils import VikingURI, get_logger
@@ -280,8 +281,9 @@ class ResourceProcessor:
             from collections import Counter
 
             logger.info(
-                "[RNFVSnapshot] target=%s artifact_backend=%s root_is_file=%s "
+                "[RNFVSnapshot] %s target=%s artifact_backend=%s root_is_file=%s "
                 "target_preexisting=%s n_entries=%d f_entries=%d v_records=%d v_levels=%s",
+                log_correlation(),
                 root_uri,
                 artifact_backend,
                 root_is_file,
@@ -340,12 +342,21 @@ class ResourceProcessor:
                     artifact_ref=artifact_ref,
                     target=target,
                 )
-        except Exception:
+        except Exception as exc:
             ResourceIngestionEventDataSource.record_stage(
                 stage="content_commit",
                 status="error",
                 duration_seconds=time.perf_counter() - content_commit_started_at,
                 account_id=ctx.account_id,
+            )
+            logger.exception(
+                "[ContentTreeCommitFailed] %s target=%s artifact_backend=%s "
+                "actions=%d error=%s",
+                log_correlation(),
+                root_uri,
+                artifact_backend,
+                len(context_plan.content_tree_actions),
+                exc,
             )
             raise
         ResourceIngestionEventDataSource.record_stage(
@@ -355,8 +366,9 @@ class ResourceProcessor:
             account_id=ctx.account_id,
         )
         logger.info(
-            "[ContentTreeCommit] target=%s artifact_backend=%s uploaded_files=%d "
+            "[ContentTreeCommit] %s target=%s artifact_backend=%s uploaded_files=%d "
             "created_dirs=%d deleted_paths=%d replaced_kinds=%d duration_ms=%.3f",
+            log_correlation(),
             root_uri,
             artifact_backend,
             sum(action.new_kind == "file" for action in context_plan.content_tree_actions),
@@ -388,8 +400,10 @@ class ResourceProcessor:
             for slot in entry.index_slots
         )
         logger.info(
-            "[ContextUpdatePlan] root=%s content=%s semantic=%s direct_index=%s index_slots=%s "
+            "[ContextUpdatePlan] %s root=%s content=%s semantic=%s direct_index=%s "
+            "index_slots=%s "
             "semantic_entries=%d execution_roots=%d",
+            log_correlation(),
             plan.root_uri,
             dict(content),
             dict(semantic),
@@ -410,14 +424,16 @@ class ResourceProcessor:
         created_dirs = sum(action.new_kind == "directory" for action in content_actions)
         if is_initial:
             logger.info(
-                "[add_resource] initial import committed root=%s files=%d dirs=%d",
+                "[add_resource] %s initial import committed root=%s files=%d dirs=%d",
+                log_correlation(),
                 root_uri,
                 uploaded_files,
                 created_dirs,
             )
             return
         logger.info(
-            "[add_resource] incremental diff committed root=%s states=%s uploaded=%d",
+            "[add_resource] %s incremental diff committed root=%s states=%s uploaded=%d",
+            log_correlation(),
             root_uri,
             dict(states),
             uploaded_files,
@@ -1283,7 +1299,8 @@ class ResourceProcessor:
                 failure_message=f"Failed to enqueue scalar update for {action.uri}",
             )
         logger.info(
-            "[DirectIndexActions] root=%s operation_counts=%s action_count=%d",
+            "[DirectIndexActions] %s root=%s operation_counts=%s action_count=%d",
+            log_correlation(),
             actions[0].uri if actions else "",
             dict(operation_counts),
             len(actions),

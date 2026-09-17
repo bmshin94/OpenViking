@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import PurePosixPath
@@ -22,7 +23,10 @@ from openviking.storage.resource_rnfv import (
 )
 from openviking.storage.vector_ids import vector_record_id
 from openviking.utils.ingest_options import IngestOptions
+from openviking.utils.log_correlation import log_correlation
 from openviking_cli.utils import VikingURI
+
+logger = logging.getLogger(__name__)
 
 
 class SemanticAction(str, Enum):
@@ -1041,6 +1045,21 @@ async def execute_content_tree_actions(
     concurrency: int | None = None,
 ) -> None:
     """Commit planned content mutations before any asynchronous work."""
+    async def run_action(action: ContentTreeAction, operation: Any) -> None:
+        try:
+            await operation
+        except Exception:
+            logger.exception(
+                "[ContentTreeActionFailed] %s operation=%s relative_path=%s "
+                "old_kind=%s new_kind=%s",
+                log_correlation(),
+                action.operation.value,
+                action.relative_path,
+                action.old_kind or "-",
+                action.new_kind or "-",
+            )
+            raise
+
     destructive = [
         action
         for action in actions
@@ -1049,12 +1068,15 @@ async def execute_content_tree_actions(
     for action in sorted(
         destructive, key=lambda item: (-item.relative_path.count("/"), item.relative_path)
     ):
-        await target.delete_file(action.relative_path)
+        await run_action(
+            action,
+            target.delete_path(action.relative_path, is_dir=action.old_kind == "directory"),
+        )
     for action in sorted(
         (action for action in actions if action.new_kind == "directory"),
         key=lambda item: (item.relative_path.count("/"), item.relative_path),
     ):
-        await target.mkdir(action.relative_path)
+        await run_action(action, target.mkdir(action.relative_path))
     file_actions = [action for action in actions if action.new_kind == "file"]
     if not file_actions:
         return
@@ -1063,8 +1085,11 @@ async def execute_content_tree_actions(
 
         concurrency = get_file_operation_concurrency()
     async def write(action: ContentTreeAction) -> None:
-        data = await store.read_bytes(artifact_ref, action.artifact_path)
-        await target.write_file(action.relative_path, data)
+        async def read_and_write() -> None:
+            data = await store.read_bytes(artifact_ref, action.artifact_path)
+            await target.write_file(action.relative_path, data)
+
+        await run_action(action, read_and_write())
 
     from openviking.utils.async_utils import bounded_map
 

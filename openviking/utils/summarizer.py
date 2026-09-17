@@ -116,10 +116,10 @@ class Summarizer:
         source = kwargs.get("semantic_source")
         generation_trigger = str(kwargs.get("generation_trigger") or "manual_refresh")
         # Pre-computed change set (local incremental import): when present, the
-        # semantic DAG restricts re-summarization/vectorization to these files
+        # semantic tree restricts re-summarization/vectorization to these files
         # instead of diffing the whole tree.
         changes = kwargs.get("changes")
-        # Per-file md5 (target-URI keyed) for those changed files, so the DAG's
+        # Per-file md5 (target-URI keyed) for those changed files, so the tree executor's
         # re-vectorization records the fresh fingerprint.
         file_md5s = kwargs.get("file_md5s") or {}
         artifact_ref = kwargs.get("artifact_ref")

@@ -25,6 +25,7 @@ from openviking.telemetry import (
 )
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.resource_summary import record_resource_queue_metrics
+from openviking.utils.log_correlation import log_correlation
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.logger import get_logger
@@ -216,8 +217,11 @@ class AddResourceProcessor(DequeueHandlerBase):
             register_telemetry(telemetry)
         request_wait_tracker = get_request_wait_tracker()
         request_wait_tracker.register_request(telemetry_id)
+        current_stage = "queued"
 
         async def _set_stage(stage: str) -> None:
+            nonlocal current_stage
+            current_stage = stage
             await tracker.update_stage(
                 msg.task_id,
                 stage,
@@ -232,6 +236,17 @@ class AddResourceProcessor(DequeueHandlerBase):
         ):
             terminal = False
             try:
+                queue_message_id = str(data.get("id") or "")
+                logger.info(
+                    "[AddResourceStarted] %s root=%s phase=%s",
+                    log_correlation(
+                        task_id=msg.task_id,
+                        telemetry_id=telemetry_id,
+                        message_id=queue_message_id,
+                    ),
+                    msg.root_uri,
+                    msg.job_phase.value,
+                )
                 if replay_result is None:
                     await tracker.start(
                         msg.task_id,
@@ -253,6 +268,17 @@ class AddResourceProcessor(DequeueHandlerBase):
                     if result.get("status") == "error":
                         errors = result.get("errors") or ["resource processing failed"]
                         error = "; ".join(str(error) for error in errors)
+                        logger.error(
+                            "[AddResourceFailed] %s root=%s task_stage=%s error=%s",
+                            log_correlation(
+                                task_id=msg.task_id,
+                                telemetry_id=telemetry_id,
+                                message_id=queue_message_id,
+                            ),
+                            msg.root_uri,
+                            current_stage,
+                            error,
+                        )
                         code = result.get("code")
                         failure_result = {"code": code} if isinstance(code, str) and code else None
                         await tracker.fail(
@@ -301,9 +327,13 @@ class AddResourceProcessor(DequeueHandlerBase):
                     resource_summary = _snapshot.summary.get("resource", {})
                     queue_summary = _snapshot.summary.get("queue", {})
                     logger.info(
-                        "[AddResourceCompleted] task_id=%s root=%s total_ms=%s "
+                        "[AddResourceCompleted] %s root=%s total_ms=%s "
                         "semantic=%s embedding=%s",
-                        msg.task_id,
+                        log_correlation(
+                            task_id=msg.task_id,
+                            telemetry_id=telemetry_id,
+                            message_id=queue_message_id,
+                        ),
                         result.get("root_uri"),
                         (resource_summary.get("total") or {}).get("duration_ms"),
                         queue_summary.get("semantic", {}),
@@ -328,10 +358,30 @@ class AddResourceProcessor(DequeueHandlerBase):
                 terminal = True
                 return ProcessResult.success()
             except asyncio.CancelledError:
+                logger.warning(
+                    "[AddResourceCancelled] %s root=%s",
+                    log_correlation(
+                        task_id=msg.task_id,
+                        telemetry_id=telemetry_id,
+                        message_id=queue_message_id,
+                    ),
+                    msg.root_uri,
+                )
                 await self._record_watch_execution(msg, "cancelled")
                 terminal = True
                 raise
             except Exception as exc:
+                logger.exception(
+                    "[AddResourceFailed] %s root=%s task_stage=%s error=%s",
+                    log_correlation(
+                        task_id=msg.task_id,
+                        telemetry_id=telemetry_id,
+                        message_id=queue_message_id,
+                    ),
+                    msg.root_uri,
+                    current_stage,
+                    exc,
+                )
                 await self._record_watch_execution(
                     msg,
                     "failed",

@@ -5,9 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from openviking.server.identity import RequestContext, Role
-from openviking.storage.queuefs.semantic_dag import (
-    DirNode,
-    SemanticDagExecutor,
+from openviking.storage.queuefs.semantic_executor import (
+    SemanticTreeExecutor,
+    SemanticTreeNode,
 )
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -18,10 +18,10 @@ def _executor():
         role=Role.USER,
     )
     with patch(
-        "openviking.storage.queuefs.semantic_dag.get_viking_fs",
+        "openviking.storage.queuefs.semantic_executor.get_viking_fs",
         return_value=SimpleNamespace(),
     ):
-        return SemanticDagExecutor(SimpleNamespace(), "resource", 2, ctx)
+        return SemanticTreeExecutor(SimpleNamespace(), "resource", 2, ctx)
 
 
 def _node(
@@ -31,7 +31,7 @@ def _node(
     uri = "viking://resources/media"
     files = [(filename, summary)]
     file_paths = [f"{uri}/{name}" for name, _ in files]
-    return DirNode(
+    return SemanticTreeNode(
         uri=uri,
         children_dirs=[],
         file_paths=file_paths,
