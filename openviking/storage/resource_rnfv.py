@@ -95,9 +95,7 @@ class RequestIntent:
                     mode=options.search_tag_mode,
                     value=tuple(options.search_tags),
                     target_levels=(
-                        frozenset({2})
-                        if str(mode) == "vectors_only"
-                        else frozenset({0, 1, 2})
+                        frozenset({2}) if str(mode) == "vectors_only" else frozenset({0, 1, 2})
                     ),
                 ),
             )
@@ -147,7 +145,6 @@ class VectorRecordSnapshot:
 @dataclass(frozen=True)
 class VectorIndexSnapshot:
     records_by_id: Mapping[str, VectorRecordSnapshot]
-    record_ids_by_key: Mapping[tuple[str, int], tuple[str, ...]]
     projected_fields: frozenset[str]
     complete: bool = True
 

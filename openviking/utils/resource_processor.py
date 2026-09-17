@@ -45,6 +45,7 @@ from openviking_cli.utils.storage import StoragePath
 if TYPE_CHECKING:
     from openviking.parse.accessors.base import LocalResource
     from openviking.parse.vlm import VLMProcessor
+    from openviking.storage.context_update_plan import ContextUpdatePlan
 
 logger = get_logger(__name__)
 _MAX_FILE_VECTORIZATION_CONCURRENCY = 64
@@ -175,7 +176,7 @@ class ResourceProcessor:
     @staticmethod
     def _store_for_parse_artifact(
         artifact_ref: Any, *, output_store: Any, viking_fs: Any, ctx: RequestContext
-    ) -> Any:
+    ) -> "ContextUpdatePlan":
         if output_store is not None and output_store.backend == artifact_ref.backend:
             return output_store
         from openviking.parse.output import store_for_artifact_ref
@@ -293,7 +294,7 @@ class ResourceProcessor:
         is_code_repo: bool,
         ingest_options: IngestOptions,
         source_metadata: Optional[Dict[str, str]],
-    ) -> tuple[Any, Any]:
+    ) -> Any:
         """Resolve and commit one directory through the canonical update plan."""
         from openviking.storage.context_update_plan import (
             build_context_update_plan_from_snapshot,
@@ -302,7 +303,6 @@ class ResourceProcessor:
         from openviking.storage.resource_diff import (
             build_rnfv_snapshot,
         )
-        from openviking.storage.resource_diff_apply import ApplyResult
         from openviking.storage.resource_target import AgfsResourceTarget
 
         target = AgfsResourceTarget(
@@ -366,63 +366,14 @@ class ResourceProcessor:
             artifact_ref=artifact_ref,
             target=target,
         )
-
-        entries = diff.entries
-        new_entries = rnfv.new.entries
-        apply_result = ApplyResult(
-            uploaded=sorted(
-                action.relative_path
-                for action in context_plan.content_tree_actions
-                if action.new_kind == "file"
-            ),
-            added=sorted(
-                path
-                for path, entry in entries.items()
-                if entry.content_state.value in {"added", "restore"} and entry.new_kind == "file"
-            ),
-            added_dirs=sorted(
-                path
-                for path, entry in entries.items()
-                if entry.content_state.value in {"added", "restore"}
-                and entry.new_kind == "directory"
-            ),
-            modified=sorted(
-                path for path, entry in entries.items() if entry.content_state.value == "modified"
-            ),
-            unchanged=sorted(
-                path
-                for path, entry in entries.items()
-                if entry.content_state.value == "unchanged" and entry.new_kind == "file"
-            ),
-            deleted=sorted(
-                path
-                for path, entry in entries.items()
-                if entry.content_state.value == "deleted" and entry.old_kind == "file"
-            ),
-            deleted_dirs=sorted(
-                path
-                for path, entry in entries.items()
-                if entry.content_state.value == "deleted" and entry.old_kind == "directory"
-            ),
-            structural=sorted(
-                path
-                for path, entry in entries.items()
-                if entry.content_state.value == "replace_kind"
-            ),
-            repair=sorted(
-                path
-                for path, entry in entries.items()
-                if entry.index_state.value in {"missing", "partial"}
-                and entry.content_state.value == "unchanged"
-            ),
-            files=sorted(path for path, entry in new_entries.items() if not entry.is_dir),
-            md5_by_rel={
-                path: str(entry.md5)
-                for path, entry in entries.items()
-                if entry.new_kind == "file" and entry.md5
-            },
+        self._log_context_update_plan(context_plan)
+        self._log_context_commit_summary(
+            diff,
+            content_actions=context_plan.content_tree_actions,
+            root_uri=root_uri,
+            is_initial=not target_preexisting,
         )
-        return apply_result, context_plan
+        return context_plan.after_content_commit()
 
     @staticmethod
     def _resolved_diff_plan(diff_plan: Any, apply_result: Any) -> Any:
@@ -559,6 +510,30 @@ class ResourceProcessor:
             dict(semantic),
             dict(direct),
             {f"{operation}:{trigger}": count for (operation, trigger), count in slots.items()},
+        )
+
+    @staticmethod
+    def _log_context_commit_summary(
+        diff: Any, *, content_actions: Any, root_uri: str, is_initial: bool
+    ) -> None:
+        from collections import Counter
+
+        states = Counter(entry.content_state.value for entry in diff.entries.values())
+        uploaded_files = sum(action.new_kind == "file" for action in content_actions)
+        created_dirs = sum(action.new_kind == "directory" for action in content_actions)
+        if is_initial:
+            logger.info(
+                "[add_resource] initial import committed root=%s files=%d dirs=%d",
+                root_uri,
+                uploaded_files,
+                created_dirs,
+            )
+            return
+        logger.info(
+            "[add_resource] incremental diff committed root=%s states=%s uploaded=%d",
+            root_uri,
+            dict(states),
+            uploaded_files,
         )
 
     async def _vectorize_prepared_files(
@@ -1058,10 +1033,7 @@ class ResourceProcessor:
                             prepared_resource=prepared_resource,
                             source_format=parse_result.source_format,
                         )
-                        (
-                            apply_result,
-                            context_update_plan,
-                        ) = await self._commit_directory_artifact_with_plan(
+                        context_update_plan = await self._commit_directory_artifact_with_plan(
                             output_store=artifact_store,
                             artifact_ref=artifact_ref,
                             doc_rel=local_artifact_doc_rel,
@@ -1078,16 +1050,6 @@ class ResourceProcessor:
                             is_code_repo=parse_result.source_format == "repository",
                             source_metadata=semantic_source,
                         )
-                        local_artifact_files = list(apply_result.files)
-                        local_incremental_file_md5s = self._apply_result_to_file_md5s(
-                            apply_result, root_uri
-                        )
-                        self._log_commit_summary(
-                            apply_result,
-                            root_uri=root_uri,
-                            is_initial=not target_preexisting,
-                        )
-                        self._log_context_update_plan(context_update_plan)
                         incremental_noop = target_preexisting and context_update_plan.is_noop()
                         temp_uri = root_uri
                         source_committed = True
@@ -1244,12 +1206,6 @@ class ResourceProcessor:
                 "target_preexisting": target_preexisting,
                 "is_code_repo": parse_result.source_format == "repository",
                 "root_is_file": root_is_file,
-                # For local incremental commits, the changed-file set is already
-                # Legacy non-plan paths still use this explicit change set.
-                "changes": local_incremental_changes,
-                "file_md5s": local_incremental_file_md5s,
-                "file_abstracts": local_file_abstracts,
-                "artifact_files": local_artifact_files,
                 "incremental_noop": incremental_noop,
                 "context_update_plan": (
                     context_update_plan.to_dict() if context_update_plan is not None else None
@@ -1261,6 +1217,13 @@ class ResourceProcessor:
                     source_format=parse_result.source_format,
                 ),
             }
+            if not use_context_update_plan:
+                prepared.update(
+                    changes=local_incremental_changes,
+                    file_md5s=local_incremental_file_md5s,
+                    file_abstracts=local_file_abstracts,
+                    artifact_files=local_artifact_files,
+                )
             if defer_post_processing:
                 result["_post_process"] = prepared
                 result["_resource_lock"] = resource_lock

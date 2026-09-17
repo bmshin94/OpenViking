@@ -548,7 +548,6 @@ async def build_rnfv_snapshot(
     base = target_uri.rstrip("/")
     prefix = base + "/"
     vector_records: Dict[str, VectorRecordSnapshot] = {}
-    record_ids_by_key: Dict[tuple[str, int], list[str]] = {}
     for record_id, record in inventory.items():
         level = int(record.get("level", -1))
         uri = str(record.get("uri") or "")
@@ -565,16 +564,12 @@ async def build_rnfv_snapshot(
             level=level,
             fields=fields,
         )
-        record_ids_by_key.setdefault((rel, level), []).append(record_id)
     return RNFVSnapshot(
         request=request,
         new=NewArtifactSnapshot(entries=new),
         formal=FormalTreeSnapshot(entries=target_files, complete=files_complete),
         vectors=VectorIndexSnapshot(
             records_by_id=vector_records,
-            record_ids_by_key={
-                key: tuple(record_ids) for key, record_ids in record_ids_by_key.items()
-            },
             projected_fields=projection,
         ),
     )

@@ -322,7 +322,7 @@ async def test_plan_commit_deletes_file_but_defers_vector_delete(tmp_path, monke
         AsyncMock(return_value={"files_processed": 0, "references_rewritten": 0}),
     )
 
-    result, plan = await ResourceProcessor(vikingdb=vikingdb)._commit_directory_artifact_with_plan(
+    plan = await ResourceProcessor(vikingdb=vikingdb)._commit_directory_artifact_with_plan(
         output_store=store,
         artifact_ref=ref,
         doc_rel="repository",
@@ -338,9 +338,9 @@ async def test_plan_commit_deletes_file_but_defers_vector_delete(tmp_path, monke
         source_metadata=None,
     )
 
-    assert result.deleted == ["b.py"]
     assert f"{_ROOT}/b.py" in agfs.removed
     assert vikingdb.deleted_uris == []
+    assert plan.content_tree_actions == ()
     assert plan.semantic_plan is not None
     assert all(entry.relative_path != "b.py" for entry in plan.semantic_plan.tree.entries)
     assert [(action.operation.value, action.record_id) for action in plan.direct_index_actions] == [
@@ -358,7 +358,7 @@ async def test_initial_plan_commit_uses_the_same_content_action_path(tmp_path, m
     vikingdb = _RecordingVikingDB({})
     monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: agfs)
 
-    result, plan = await ResourceProcessor(vikingdb=vikingdb)._commit_directory_artifact_with_plan(
+    plan = await ResourceProcessor(vikingdb=vikingdb)._commit_directory_artifact_with_plan(
         output_store=store,
         artifact_ref=ref,
         doc_rel="repository",
@@ -374,8 +374,8 @@ async def test_initial_plan_commit_uses_the_same_content_action_path(tmp_path, m
         source_metadata=None,
     )
 
-    assert set(result.added) == {"a.py", "src/b.py"}
     assert set(agfs.written) == {f"{_ROOT}/a.py", f"{_ROOT}/src/b.py"}
+    assert plan.content_tree_actions == ()
     assert plan.semantic_plan is not None
     entries = {entry.relative_path: entry for entry in plan.semantic_plan.tree.entries}
     assert entries[""].semantic_action.value == "aggregate"

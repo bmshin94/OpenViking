@@ -66,6 +66,37 @@ def test_context_plan_has_explicit_actions_and_compact_semantic_roundtrip():
     assert node["index_slots"][0]["record_id"] == "external-id"
 
 
+def test_after_content_commit_keeps_only_derived_actions():
+    from openviking.storage.context_update_plan import (
+        ContentTreeAction,
+        ContextUpdatePlan,
+        IndexAction,
+    )
+
+    plan = ContextUpdatePlan(
+        "viking://resources/repo",
+        "resource",
+        content_tree_actions=(
+            ContentTreeAction(
+                "upsert",
+                "a.py",
+                new_kind="file",
+                artifact_path="repository/a.py",
+                md5="new",
+            ),
+        ),
+        direct_index_actions=(
+            IndexAction("delete", "viking://resources/repo/old.py", 2, "old-l2"),
+        ),
+    )
+
+    committed = plan.after_content_commit()
+
+    assert committed.content_tree_actions == ()
+    assert committed.semantic_plan is plan.semantic_plan
+    assert committed.direct_index_actions is plan.direct_index_actions
+
+
 def test_context_plan_rejects_conflicting_record_operations():
     from openviking.storage.context_update_plan import (
         ContextUpdatePlan,
@@ -170,6 +201,81 @@ def test_semantic_plan_rejects_disconnected_or_mistyped_actions():
         )
 
 
+def test_semantic_plan_validates_ancestors_without_rescanning_entries():
+    from openviking.storage.context_update_plan import (
+        IndexSlot,
+        SemanticPlan,
+        SemanticTreeEntry,
+        SemanticTreeSnapshot,
+    )
+
+    class CountingEntries:
+        def __init__(self, entries):
+            self._entries = tuple(entries)
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return iter(self._entries)
+
+    directories = [
+        "/".join(["src", *[f"level-{index}" for index in range(depth)]]) for depth in range(8)
+    ]
+    entries = CountingEntries(
+        [SemanticTreeEntry("", "directory", "unchanged", "aggregate")]
+        + [SemanticTreeEntry(path, "directory", "unchanged", "aggregate") for path in directories]
+        + [
+            SemanticTreeEntry(
+                directories[-1] + "/a.py",
+                "file",
+                "modified",
+                "generate",
+                md5="new",
+                index_slots=(IndexSlot(2, "a-l2", operation="upsert", trigger="output_ready"),),
+            )
+        ]
+    )
+
+    SemanticPlan(
+        "viking://resources/repo",
+        "resource",
+        SemanticTreeSnapshot(entries),
+    )
+
+    assert entries.iterations <= 4
+
+
+def test_semantic_plan_rejects_missing_higher_ancestor_independent_of_entry_order():
+    from openviking.storage.context_update_plan import (
+        IndexSlot,
+        SemanticPlan,
+        SemanticTreeEntry,
+        SemanticTreeSnapshot,
+    )
+
+    with pytest.raises(ValueError, match="lacks ancestor 'a'.*a/b/c.py"):
+        SemanticPlan(
+            "viking://resources/repo",
+            "resource",
+            SemanticTreeSnapshot(
+                (
+                    SemanticTreeEntry("", "directory", "unchanged", "aggregate"),
+                    SemanticTreeEntry(
+                        "a/b/c.py",
+                        "file",
+                        "modified",
+                        "generate",
+                        md5="new",
+                        index_slots=(
+                            IndexSlot(2, "c-l2", operation="upsert", trigger="output_ready"),
+                        ),
+                    ),
+                    SemanticTreeEntry("a/b", "directory", "unchanged", "aggregate"),
+                )
+            ),
+        )
+
+
 def test_index_slot_rejects_trigger_without_operation():
     from openviking.storage.context_update_plan import IndexSlot
 
@@ -216,7 +322,7 @@ async def test_resolver_compares_missing_fingerprints_with_bounded_reads():
         RequestIntent("viking://resources/repo", "semantic_and_vectors"),
         NewArtifactSnapshot({p: NewEntry() for p in paths}),
         FormalTreeSnapshot({p: TargetFile() for p in paths}),
-        VectorIndexSnapshot({}, {}, frozenset({"id", "uri", "level", "md5"})),
+        VectorIndexSnapshot({}, frozenset({"id", "uri", "level", "md5"})),
     )
     active = peak = 0
     gate = asyncio.Event()
@@ -266,7 +372,7 @@ async def test_resolver_rejects_incomplete_snapshot_before_io():
         RequestIntent("viking://resources/repo", "semantic_and_vectors"),
         NewArtifactSnapshot({}, complete=False),
         FormalTreeSnapshot({}),
-        VectorIndexSnapshot({}, {}, frozenset({"id", "uri", "level", "md5"})),
+        VectorIndexSnapshot({}, frozenset({"id", "uri", "level", "md5"})),
     )
     store, target = AsyncMock(), AsyncMock()
     resolve = getattr(resource_diff, "resolve_resource_diff", None)
@@ -294,7 +400,7 @@ async def test_resolver_hashes_new_file_when_manifest_md5_is_missing():
         RequestIntent("viking://resources/repo", "semantic_and_vectors"),
         NewArtifactSnapshot({"a.py": NewEntry()}),
         FormalTreeSnapshot({}),
-        VectorIndexSnapshot({}, {}, frozenset({"id", "uri", "level", "md5"})),
+        VectorIndexSnapshot({}, frozenset({"id", "uri", "level", "md5"})),
     )
     store = AsyncMock()
     store.read_bytes.return_value = b"new body"
@@ -1007,7 +1113,7 @@ async def test_snapshot_builder_returns_one_canonical_context_plan():
         request=RequestIntent(root, "semantic_and_vectors"),
         new=NewArtifactSnapshot({"a.py": NewEntry(md5="new")}),
         formal=FormalTreeSnapshot({}),
-        vectors=VectorIndexSnapshot({}, {}, frozenset({"id", "uri", "level", "md5"})),
+        vectors=VectorIndexSnapshot({}, frozenset({"id", "uri", "level", "md5"})),
     )
     diff, plan = await build_context_update_plan_from_snapshot(
         snapshot=snapshot,
@@ -1059,9 +1165,6 @@ async def test_snapshot_builder_hydrates_scalars_for_vectors_only_upsert():
         formal=FormalTreeSnapshot({"a.py": TargetFile()}),
         vectors=VectorIndexSnapshot(
             {record.record_id: record},
-            {
-                ("a.py", 2): (record.record_id,),
-            },
             frozenset({"id", "uri", "level", "md5", "abstract"}),
         ),
     )
@@ -1874,7 +1977,6 @@ async def test_process_resource_does_not_handoff_local_artifact(
     from openviking.parse.output import LocalParseOutputStore
     from openviking.server.identity import RequestContext, Role
     from openviking.storage.context_update_plan import ContextUpdatePlan
-    from openviking.storage.resource_diff_apply import ApplyResult
     from openviking.utils.resource_processor import ResourceProcessor
     from openviking_cli.session.user_id import UserIdentifier
 
@@ -1908,10 +2010,7 @@ async def test_process_resource_does_not_handoff_local_artifact(
         )
     )
     processor._commit_directory_artifact_with_plan = AsyncMock(
-        return_value=(
-            ApplyResult(added=["a.py"], files=["a.py"]),
-            ContextUpdatePlan("viking://resources/repo", "resource"),
-        )
+        return_value=ContextUpdatePlan("viking://resources/repo", "resource")
     )
     viking_fs = SimpleNamespace(
         exists=AsyncMock(return_value=False),
@@ -1931,5 +2030,8 @@ async def test_process_resource_does_not_handoff_local_artifact(
     )
 
     assert result["_post_process"]["artifact_ref"] is None
+    assert "file_md5s" not in result["_post_process"]
+    assert "file_abstracts" not in result["_post_process"]
+    assert "artifact_files" not in result["_post_process"]
     artifact_path = tmp_path.joinpath("artifacts", ref.root.split("/")[-1])
     assert artifact_path.exists() is cleanup_fails

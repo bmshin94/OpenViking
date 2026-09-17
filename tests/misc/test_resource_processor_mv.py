@@ -423,7 +423,6 @@ async def test_directory_semantic_ingest_commits_plan_before_summarizer(monkeypa
         SemanticTreeEntry,
         SemanticTreeSnapshot,
     )
-    from openviking.storage.resource_diff_apply import ApplyResult
     from openviking.utils.resource_processor import ResourceProcessor
 
     fake_fs = _FakeVikingFS()
@@ -469,9 +468,7 @@ async def test_directory_semantic_ingest_commits_plan_before_summarizer(monkeypa
             _root_is_file=False,
         )
     )
-    rp._commit_directory_artifact_with_plan = AsyncMock(
-        return_value=(ApplyResult(added=["a.py"], files=["a.py"]), context_plan)
-    )
+    rp._commit_directory_artifact_with_plan = AsyncMock(return_value=context_plan)
     summarize = AsyncMock(return_value={"status": "success", "enqueued_count": 1})
     rp._summarizer = SimpleNamespace(summarize=summarize)
 

@@ -194,36 +194,35 @@ class SemanticPlan:
         object.__setattr__(self, "ingest_options", IngestOptions.from_value(self.ingest_options))
         if self.context_type not in {"resource", "skill", "memory"}:
             raise ValueError(f"invalid context_type: {self.context_type}")
-        if self.tree.entries and not any(entry.relative_path == "" for entry in self.tree.entries):
+        entries_by_path = {entry.relative_path: entry for entry in self.tree.entries}
+        if entries_by_path and "" not in entries_by_path:
             raise ValueError("semantic plan must contain the resource root")
-        paths = {entry.relative_path for entry in self.tree.entries}
-        for entry in self.tree.entries:
+        for entry in entries_by_path.values():
             if not entry.relative_path:
                 continue
             parent = _parent(entry.relative_path)
-            if parent not in paths:
+            if parent not in entries_by_path:
                 raise ValueError(
                     f"semantic plan lacks parent {parent!r} for {entry.relative_path!r}"
                 )
-            ancestors = []
             current = parent
             while True:
-                ancestors.append(current)
-                if not current:
-                    break
-                current = _parent(current)
-            for ancestor in ancestors:
-                ancestor_entry = next(
-                    item for item in self.tree.entries if item.relative_path == ancestor
-                )
+                if current not in entries_by_path:
+                    raise ValueError(
+                        f"semantic plan lacks ancestor {current!r} for {entry.relative_path!r}"
+                    )
+                ancestor_entry = entries_by_path[current]
                 if (
                     entry.semantic_action is not SemanticAction.REUSE
                     and ancestor_entry.semantic_action is not SemanticAction.AGGREGATE
                 ):
                     raise ValueError(
-                        f"semantic plan ancestor {ancestor!r} must aggregate active descendant "
+                        f"semantic plan ancestor {current!r} must aggregate active descendant "
                         f"{entry.relative_path!r}"
                     )
+                if not current:
+                    break
+                current = _parent(current)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -357,6 +356,17 @@ class ContextUpdatePlan:
             not self.content_tree_actions
             and self.semantic_plan is None
             and not self.direct_index_actions
+        )
+
+    def after_content_commit(self) -> "ContextUpdatePlan":
+        """Drop synchronous content actions before the async handoff."""
+        if not self.content_tree_actions:
+            return self
+        return ContextUpdatePlan(
+            root_uri=self.root_uri,
+            context_type=self.context_type,
+            semantic_plan=self.semantic_plan,
+            direct_index_actions=self.direct_index_actions,
         )
 
     def to_dict(self) -> dict[str, Any]:
