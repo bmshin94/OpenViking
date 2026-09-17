@@ -645,22 +645,35 @@ async def build_rnfv_snapshot(
     request = request_intent or RequestIntent(
         target_uri=target_uri, processing_mode="semantic_and_vectors"
     )
-    inventory = artifact_inventory or await prepare_artifact_inventory(
-        store, artifact_ref, doc_rel=doc_rel, root_is_file=root_is_file
-    )
-    new = inventory.entries
-    if target_preexisting:
-        target_files, files_complete = await read_target_file_snapshot(
+
+    async def read_artifact() -> ArtifactInventory:
+        return artifact_inventory or await prepare_artifact_inventory(
+            store, artifact_ref, doc_rel=doc_rel, root_is_file=root_is_file
+        )
+
+    async def read_formal() -> tuple[Dict[str, TargetFile], bool]:
+        if not target_preexisting:
+            return {}, True
+        return await read_target_file_snapshot(
             viking_fs, target_uri, ctx=ctx, root_is_file=root_is_file
         )
-    else:
-        target_files, files_complete = {}, True
+
     projection = request.required_vector_fields()
     if root_is_file or request.processing_mode == "vectors_only":
         projection = projection | {"abstract"}
-    inventory = await vikingdb.get_incremental_inventory_under_uri(
-        target_uri, ctx=ctx, output_fields=sorted(projection)
-    )
+
+    async with asyncio.TaskGroup() as group:
+        artifact_task = group.create_task(read_artifact())
+        formal_task = group.create_task(read_formal())
+        vector_task = group.create_task(
+            _read_incremental_vector_inventory(
+                vikingdb, target_uri=target_uri, ctx=ctx, projection=projection
+            )
+        )
+
+    artifact = artifact_task.result()
+    target_files, files_complete = formal_task.result()
+    inventory = vector_task.result()
     base = target_uri.rstrip("/")
     prefix = base + "/"
     vector_records: Dict[str, VectorRecordSnapshot] = {}
@@ -682,12 +695,25 @@ async def build_rnfv_snapshot(
         )
     return RNFVSnapshot(
         request=request,
-        new=NewArtifactSnapshot(entries=new),
+        new=NewArtifactSnapshot(entries=artifact.entries),
         formal=FormalTreeSnapshot(entries=target_files, complete=files_complete),
         vectors=VectorIndexSnapshot(
             records_by_id=vector_records,
             projected_fields=projection,
         ),
+    )
+
+
+async def _read_incremental_vector_inventory(
+    vikingdb: Any,
+    *,
+    target_uri: str,
+    ctx: Any,
+    projection: frozenset[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Read the lightweight V snapshot used to build RNFV."""
+    return await vikingdb.get_incremental_inventory_under_uri(
+        target_uri, ctx=ctx, output_fields=sorted(projection)
     )
 
 

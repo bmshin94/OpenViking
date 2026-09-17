@@ -9,6 +9,7 @@ plumbing and that permission-hidden / truncated target trees mark the file
 snapshot incomplete so the planner refuses deletions.
 """
 
+import asyncio
 import json
 
 import pytest
@@ -356,6 +357,62 @@ async def test_build_rnfv_snapshot_reuses_prepared_artifact_inventory(tmp_path):
 
     assert set(snapshot.new.entries) == {"a.py"}
     store.list.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_build_rnfv_snapshot_starts_new_formal_and_vector_reads_concurrently(tmp_path, monkeypatch):
+    from openviking.parse.output import LocalParseOutputStore
+    from openviking.storage.resource_diff import ArtifactInventory
+    from openviking.storage.viking_fs._diff_plan import NewEntry, TargetFile
+
+    root = "viking://resources/x"
+    store = LocalParseOutputStore(local_root=str(tmp_path / "out"))
+    ref = await store.create_artifact(root_type="dir")
+    started = set()
+    release = asyncio.Event()
+
+    async def read_new(*args, **kwargs):
+        started.add("new")
+        await release.wait()
+        return ArtifactInventory(entries={"a.py": NewEntry(md5="new")}, artifact_paths={})
+
+    async def read_formal(*args, **kwargs):
+        started.add("formal")
+        await release.wait()
+        return {"a.py": TargetFile()}, True
+
+    async def read_vectors(*args, **kwargs):
+        started.add("vectors")
+        await release.wait()
+        return {"record": {"id": "record", "uri": f"{root}/a.py", "level": 2, "md5": "old"}}
+
+    monkeypatch.setattr("openviking.storage.resource_diff.prepare_artifact_inventory", read_new)
+    monkeypatch.setattr("openviking.storage.resource_diff.read_target_file_snapshot", read_formal)
+    monkeypatch.setattr(
+        "openviking.storage.resource_diff._read_incremental_vector_inventory", read_vectors
+    )
+
+    task = asyncio.create_task(
+        build_rnfv_snapshot(
+            viking_fs=_FakeVikingFS([]),
+            vikingdb=_FakeVikingDB({}),
+            store=store,
+            artifact_ref=ref,
+            target_uri=root,
+            ctx=_Ctx(),
+        )
+    )
+    for _ in range(10):
+        if started == {"new", "formal", "vectors"}:
+            break
+        await asyncio.sleep(0)
+    assert started == {"new", "formal", "vectors"}
+    release.set()
+    snapshot = await task
+
+    assert snapshot.new.entries["a.py"].md5 == "new"
+    assert snapshot.formal.entries["a.py"].is_dir is False
+    assert snapshot.vectors.records_by_id["record"].fields["md5"] == "old"
 
 
 @pytest.mark.asyncio
