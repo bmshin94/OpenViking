@@ -16,6 +16,8 @@ import pytest
 from openviking.parse.output import AgfsParseOutputStore, ParseArtifactRef
 from openviking.storage.resource_diff import (
     build_resource_diff_snapshot,
+    build_rnfv_snapshot,
+    prepare_artifact_inventory,
     read_new_manifest,
     read_target_file_snapshot,
     read_target_vector_snapshot,
@@ -63,6 +65,12 @@ class _FakeVikingFS:
                 name = head[0]
                 seen[name] = {"name": name, "uri": f"{prefix}{name}", "isDir": len(head) > 1}
         return list(seen.values())
+
+    async def read(self, uri, **kwargs):
+        return self.files[uri]
+
+    async def write_file(self, uri, content, **kwargs):
+        self.files[uri] = content.encode("utf-8") if isinstance(content, str) else content
 
 
 class _FakeVikingDB:
@@ -255,6 +263,99 @@ async def test_resource_diff_snapshot_reuses_all_level_inventory_for_l2_diff(tmp
     assert set(snapshot.vector_inventory) == {"root-l0", "a-l2"}
     assert snapshot.plan.needs_body_compare == ["a.py"]
     assert set(vikingdb.inventory_output_fields) == {"id", "uri", "level", "md5"}
+
+
+@pytest.mark.asyncio
+async def test_prepare_artifact_inventory_rewrites_images_during_single_artifact_walk(tmp_path):
+    from unittest.mock import AsyncMock
+
+    from openviking.parse.output import LocalParseOutputStore
+    from openviking.utils.content_hash import content_md5
+
+    store = LocalParseOutputStore(local_root=str(tmp_path / "out"))
+    ref = await store.create_artifact(root_type="dir")
+    await store.write_bytes(ref, "repository/docs/guide.md", b"![diagram](diagram.png)\n")
+    await store.write_bytes(ref, "repository/docs/diagram.png", b"png")
+    await store.write_text(
+        ref,
+        "repository/.image_mappings.json",
+        json.dumps({"docs/guide.md": {"diagram.png": "diagram.png"}}),
+    )
+    store.list = AsyncMock(wraps=store.list)
+
+    inventory = await prepare_artifact_inventory(
+        store,
+        ref,
+        doc_rel="repository",
+        target_root_uri="viking://resources/repo",
+    )
+
+    assert set(inventory.entries) == {"docs", "docs/guide.md", "docs/diagram.png"}
+    assert inventory.entries["docs/guide.md"].md5 == content_md5(
+        b"![diagram](viking://resources/repo/docs/diagram.png)\n"
+    )
+    assert inventory.artifact_paths["docs/guide.md"] == "repository/docs/guide.md"
+    assert inventory.rewritten_paths == frozenset({"docs/guide.md"})
+    assert [call.args[1] for call in store.list.await_args_list] == ["repository", "repository/docs"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_artifact_inventory_rewrites_images_in_agfs_artifact():
+    from openviking.utils.content_hash import content_md5
+
+    vfs = _FakeVikingFS(
+        [],
+        files={
+            "viking://temp/n/repository/docs/guide.md": b"![diagram](diagram.png)\n",
+            "viking://temp/n/repository/docs/diagram.png": b"png",
+            "viking://temp/n/repository/.image_mappings.json": json.dumps(
+                {"docs/guide.md": {"diagram.png": "diagram.png"}}
+            ).encode(),
+        },
+    )
+    store = AgfsParseOutputStore(viking_fs=vfs)
+    ref = ParseArtifactRef(backend="agfs", root="viking://temp/n", root_type="dir")
+
+    inventory = await prepare_artifact_inventory(
+        store,
+        ref,
+        doc_rel="repository",
+        target_root_uri="viking://resources/repo",
+    )
+
+    expected = b"![diagram](viking://resources/repo/docs/diagram.png)\n"
+    assert vfs.files["viking://temp/n/repository/docs/guide.md"] == expected
+    assert inventory.entries["docs/guide.md"].md5 == content_md5(expected)
+
+
+@pytest.mark.asyncio
+async def test_build_rnfv_snapshot_reuses_prepared_artifact_inventory(tmp_path):
+    from unittest.mock import AsyncMock
+
+    from openviking.parse.output import LocalParseOutputStore
+
+    root = "viking://resources/x"
+    store = LocalParseOutputStore(local_root=str(tmp_path / "out"))
+    ref = await store.create_artifact(root_type="dir")
+    await store.write_bytes(ref, "repository/a.py", b"a")
+    store.list = AsyncMock(wraps=store.list)
+    inventory = await prepare_artifact_inventory(store, ref, doc_rel="repository")
+    store.list.reset_mock()
+
+    snapshot = await build_rnfv_snapshot(
+        viking_fs=_FakeVikingFS([]),
+        vikingdb=_FakeVikingDB({}),
+        store=store,
+        artifact_ref=ref,
+        target_uri=root,
+        ctx=_Ctx(),
+        doc_rel="repository",
+        artifact_inventory=inventory,
+        target_preexisting=False,
+    )
+
+    assert set(snapshot.new.entries) == {"a.py"}
+    store.list.assert_not_awaited()
 
 
 @pytest.mark.asyncio

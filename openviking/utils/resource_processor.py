@@ -65,7 +65,12 @@ class _DocRelStore:
         self._base = base
 
     async def read_bytes(self, ref: Any, rel_path: str) -> bytes:
-        artifact_rel = f"{self._base}/{rel_path}" if rel_path else self._base
+        normalized = str(rel_path or "").strip("/")
+        artifact_rel = (
+            normalized
+            if not self._base or normalized == self._base or normalized.startswith(self._base + "/")
+            else f"{self._base}/{normalized}"
+        )
         return await self._store.read_bytes(ref, artifact_rel)
 
 
@@ -302,6 +307,7 @@ class ResourceProcessor:
         )
         from openviking.storage.resource_diff import (
             build_rnfv_snapshot,
+            prepare_artifact_inventory,
         )
         from openviking.storage.resource_target import AgfsResourceTarget
 
@@ -312,9 +318,7 @@ class ResourceProcessor:
             ctx=ctx,
             lease_ref=lease_ref,
         )
-        from openviking.parse.image_rewrite import rewrite_artifact_image_uris
-
-        await rewrite_artifact_image_uris(
+        artifact_inventory = await prepare_artifact_inventory(
             output_store,
             artifact_ref,
             doc_rel=doc_rel,
@@ -341,10 +345,8 @@ class ResourceProcessor:
             doc_rel=doc_rel,
             request_intent=request,
             target_preexisting=target_preexisting,
+            artifact_inventory=artifact_inventory,
         )
-        artifact_paths = {
-            path: path for path, entry in rnfv.new.entries.items() if not entry.is_dir
-        }
         diff, context_plan = await build_context_update_plan_from_snapshot(
             snapshot=rnfv,
             store=_DocRelStore(output_store, doc_rel),
@@ -356,7 +358,7 @@ class ResourceProcessor:
             account_id=ctx.account_id,
             ctx=ctx,
             root_preexisting=target_preexisting,
-            artifact_paths=artifact_paths,
+            artifact_paths=artifact_inventory.artifact_paths,
             ingest_options=ingest_options,
             source_metadata=source_metadata,
         )

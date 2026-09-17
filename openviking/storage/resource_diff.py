@@ -9,8 +9,9 @@ pure). It gathers four snapshots into the typed data the planner expects:
   such as tags that this request explicitly wants to mutate.
 
 - ``N`` new-artifact manifest — the files a parser produced, read from the
-  parse output store. md5 is filled later at the final-bytes upload site, so it
-  is left empty here rather than reading bytes back just to fingerprint them.
+  parse output store. Canonical add-resource prepares it once before planning:
+  image references are rewritten to their final URI and their final-byte md5 is
+  retained in the resulting inventory.
 - ``F`` target file tree — one unbounded ``tree`` call. Any permission-denied
   subtree (or a truncated scan) marks the snapshot incomplete so the planner
   refuses deletions instead of treating unreadable files as removed.
@@ -25,6 +26,7 @@ The canonical ``add_resources`` path resolves these snapshots into a
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections import Counter
 from dataclasses import dataclass
@@ -88,6 +90,20 @@ class ResourceDiffEntry:
 @dataclass(frozen=True)
 class ResourceDiffResult:
     entries: Mapping[str, ResourceDiffEntry]
+
+
+@dataclass(frozen=True)
+class ArtifactInventory:
+    """Prepared N snapshot plus paths relative to its parse artifact.
+
+    ``entries`` are rooted at the final resource URI; ``artifact_paths`` point
+    to the same files under the parse artifact. The latter keeps diff body
+    fallbacks independent from the parser's optional document wrapper.
+    """
+
+    entries: Mapping[str, NewEntry]
+    artifact_paths: Mapping[str, str]
+    rewritten_paths: frozenset[str] = frozenset()
 
 
 def _index_state(
@@ -358,51 +374,145 @@ async def read_target_vector_snapshot(
     return vectors
 
 
+async def prepare_artifact_inventory(
+    store: Any,
+    ref: Any,
+    *,
+    doc_rel: str = "",
+    target_root_uri: str | None = None,
+    root_is_file: bool = False,
+) -> ArtifactInventory:
+    """Prepare an artifact once and return its final-byte N snapshot.
+
+    The one recursive walk supplies the file inventory consumed by RNFV and,
+    when a final target URI is known, rewrites mapped markdown image references
+    in place. Rewritten markdown immediately receives an updated manifest MD5,
+    so the next diff compares the exact bytes that would be uploaded.
+    """
+    from openviking.parse.image_rewrite import IMAGE_MAPPINGS_FILENAME, _rewrite_content
+    from openviking.parse.output import read_artifact_manifest, write_artifact_manifest
+    from openviking.utils.content_hash import content_md5
+
+    base = doc_rel.strip("/")
+    prefix = f"{base}/" if base else ""
+    md5_by_artifact_rel = await read_artifact_manifest(store, ref)
+    entries: Dict[str, NewEntry] = {}
+    artifact_paths: Dict[str, str] = {}
+    rewritten_paths: set[str] = set()
+
+    def target_relative(artifact_rel: str) -> str:
+        if base and artifact_rel.startswith(prefix):
+            return artifact_rel[len(prefix) :]
+        return artifact_rel
+
+    if root_is_file:
+        return ArtifactInventory(
+            entries={"": NewEntry(md5=md5_by_artifact_rel.get(base, ""), is_dir=False)},
+            artifact_paths={"": base},
+        )
+
+    async def walk(
+        directory: str,
+        mapping_dir: str = "",
+        inherited_mappings: Mapping[str, Mapping[str, str]] | None = None,
+    ) -> None:
+        directory_entries = await store.list(ref, directory)
+        current_mappings = inherited_mappings or {}
+        current_mapping_dir = mapping_dir
+        mapping_entry = next(
+            (entry for entry in directory_entries if entry.name == IMAGE_MAPPINGS_FILENAME),
+            None,
+        )
+        if mapping_entry is not None:
+            try:
+                loaded = json.loads(
+                    (await store.read_bytes(ref, mapping_entry.rel_path)).decode("utf-8")
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[ArtifactInventory] Ignoring unreadable image mapping sidecar %s: %s",
+                    mapping_entry.rel_path,
+                    exc,
+                )
+                loaded = None
+            if not isinstance(loaded, dict):
+                if loaded is not None:
+                    logger.warning(
+                        "[ArtifactInventory] Ignoring invalid image mapping sidecar %s",
+                        mapping_entry.rel_path,
+                    )
+            else:
+                current_mappings = loaded
+                current_mapping_dir = directory
+
+        available_files = {
+            entry.name
+            for entry in directory_entries
+            if not entry.is_dir and not entry.name.startswith(".")
+        }
+        for entry in directory_entries:
+            if _is_excluded_rel_path(entry.rel_path):
+                continue
+            relative_path = target_relative(entry.rel_path)
+            if entry.is_dir:
+                if relative_path:
+                    entries[relative_path] = NewEntry(is_dir=True)
+                await walk(entry.rel_path, current_mapping_dir, current_mappings)
+                continue
+
+            if not relative_path:
+                continue
+            md5 = md5_by_artifact_rel.get(entry.rel_path, "")
+            if target_root_uri and entry.name.lower().endswith((".md", ".markdown")):
+                mapping_key = (
+                    entry.rel_path[len(current_mapping_dir) + 1 :]
+                    if current_mapping_dir and entry.rel_path.startswith(current_mapping_dir + "/")
+                    else entry.rel_path
+                )
+                path_mappings = current_mappings.get(mapping_key)
+                if isinstance(path_mappings, dict) and path_mappings:
+                    content = (await store.read_bytes(ref, entry.rel_path)).decode("utf-8")
+                    target_uri = f"{target_root_uri.rstrip('/')}/{relative_path}"
+                    rewritten, count = _rewrite_content(
+                        content,
+                        target_uri.rsplit("/", 1)[0],
+                        available_files,
+                        {str(key): str(value) for key, value in path_mappings.items()},
+                    )
+                    if count:
+                        final_bytes = rewritten.encode("utf-8")
+                        await store.write_bytes(ref, entry.rel_path, final_bytes)
+                        md5 = content_md5(final_bytes)
+                        md5_by_artifact_rel[entry.rel_path] = md5
+                        rewritten_paths.add(relative_path)
+            entries[relative_path] = NewEntry(md5=md5, is_dir=False)
+            artifact_paths[relative_path] = entry.rel_path
+
+    await walk(base)
+    if rewritten_paths:
+        await write_artifact_manifest(store, ref, md5_by_artifact_rel)
+    return ArtifactInventory(
+        entries=entries,
+        artifact_paths=artifact_paths,
+        rewritten_paths=frozenset(rewritten_paths),
+    )
+
+
 async def read_new_manifest(
     store: Any, ref: Any, *, doc_rel: str = "", root_is_file: bool = False
 ) -> Dict[str, NewEntry]:
-    """Walk the parse output store and return ``rel_path -> NewEntry``.
+    """Read the new-artifact snapshot without target-dependent preparation.
 
-    md5 is populated from the artifact manifest (``.artifact_manifest.json``)
-    written at upload time, so the diff can compare fingerprints without
-    re-reading files. A missing/unreadable manifest leaves md5 empty and the diff
-    falls back to comparing file bytes.
-
-    ``doc_rel`` (e.g. ``repository``) is stripped from every path so the manifest
-    keys line up with the target resource tree, which has no such wrapper.
+    Legacy callers use this compatibility wrapper. Canonical add-resource uses
+    :func:`prepare_artifact_inventory` and passes that result into RNFV.
     """
-    from openviking.parse.output import read_artifact_manifest
-
-    manifest: Dict[str, NewEntry] = {}
-    base = doc_rel.strip("/")
-    prefix = f"{base}/" if base else ""
-
-    # md5 sidecar is keyed by artifact-relative path (pre-strip); read once. A
-    # missing manifest yields empty md5 so the diff compares bytes instead of
-    # assuming equality.
-    md5_by_artifact_rel = await read_artifact_manifest(store, ref)
-
-    if root_is_file:
-        return {"": NewEntry(md5=md5_by_artifact_rel.get(base, ""), is_dir=False)}
-
-    async def _walk(rel: str) -> None:
-        for entry in await store.list(ref, rel):
-            if _is_excluded_rel_path(entry.rel_path):
-                continue
-            if entry.is_dir:
-                key = entry.rel_path[len(prefix) :] if prefix else entry.rel_path
-                if key:
-                    manifest[key] = NewEntry(is_dir=True)
-                await _walk(entry.rel_path)
-                continue
-            key = entry.rel_path[len(prefix) :] if prefix else entry.rel_path
-            if key:
-                manifest[key] = NewEntry(
-                    md5=md5_by_artifact_rel.get(entry.rel_path, ""), is_dir=False
-                )
-
-    await _walk(base)
-    return manifest
+    return dict(
+        (
+            await prepare_artifact_inventory(
+                store, ref, doc_rel=doc_rel, root_is_file=root_is_file
+            )
+        ).entries
+    )
 
 
 async def build_resource_diff_plan(
@@ -466,6 +576,7 @@ async def build_resource_diff_snapshot(
     require_vectors: bool = True,
     request_intent: RequestIntent | None = None,
     root_is_file: bool = False,
+    artifact_inventory: ArtifactInventory | None = None,
 ) -> ResourceDiffSnapshot:
     """Read a complete R/N/F/V snapshot and build its DiffPlan."""
     rnfv = await build_rnfv_snapshot(
@@ -479,6 +590,7 @@ async def build_resource_diff_snapshot(
         request_intent=request_intent,
         root_is_file=root_is_file,
         target_preexisting=True,
+        artifact_inventory=artifact_inventory,
     )
     new = rnfv.new.entries
     target_files = rnfv.formal.entries
@@ -527,12 +639,16 @@ async def build_rnfv_snapshot(
     request_intent: RequestIntent | None = None,
     root_is_file: bool = False,
     target_preexisting: bool = True,
+    artifact_inventory: ArtifactInventory | None = None,
 ) -> RNFVSnapshot:
     """Read the complete R/N/F/V inputs without deriving an executable plan."""
     request = request_intent or RequestIntent(
         target_uri=target_uri, processing_mode="semantic_and_vectors"
     )
-    new = await read_new_manifest(store, artifact_ref, doc_rel=doc_rel, root_is_file=root_is_file)
+    inventory = artifact_inventory or await prepare_artifact_inventory(
+        store, artifact_ref, doc_rel=doc_rel, root_is_file=root_is_file
+    )
+    new = inventory.entries
     if target_preexisting:
         target_files, files_complete = await read_target_file_snapshot(
             viking_fs, target_uri, ctx=ctx, root_is_file=root_is_file
@@ -655,6 +771,7 @@ def _log_diff_diagnostics(
 
 
 __all__ = [
+    "ArtifactInventory",
     "ContentState",
     "IndexState",
     "ResourceDiffEntry",
@@ -662,6 +779,7 @@ __all__ = [
     "build_resource_diff_plan",
     "build_resource_diff_snapshot",
     "build_rnfv_snapshot",
+    "prepare_artifact_inventory",
     "ResourceDiffSnapshot",
     "read_new_manifest",
     "read_target_file_snapshot",
