@@ -1982,30 +1982,36 @@ class VikingVectorIndexBackend:
         *,
         ctx: RequestContext,
         batch_size: int = 100,
+        output_fields: Optional[Container[str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """Load required non-vector fields, using strict DSL before ID fallback."""
+        """Load requested non-vector fields, using strict DSL before ID fallback."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         requested_ids = list(expected)
-        output_fields = list(INCREMENTAL_HYDRATION_OUTPUT_FIELDS)
-        try:
-            collection_meta = await self.get_collection_meta(ctx=ctx)
-            schema_fields = [
-                str(item.get("FieldName") or "")
-                for item in (collection_meta or {}).get("Fields", [])
-            ]
-            dynamic_fields = [
-                field
-                for field in schema_fields
-                if field
-                and field not in {"vector", "sparse_vector", "content"}
-            ]
-            if dynamic_fields:
-                output_fields = list(dict.fromkeys(dynamic_fields))
-        except Exception:
-            # Backends without collection metadata retain the known portable
-            # projection; correctness remains fail-closed at identity checks.
-            pass
+        if output_fields is None:
+            selected_fields = list(INCREMENTAL_HYDRATION_OUTPUT_FIELDS)
+            try:
+                collection_meta = await self.get_collection_meta(ctx=ctx)
+                schema_fields = [
+                    str(item.get("FieldName") or "")
+                    for item in (collection_meta or {}).get("Fields", [])
+                ]
+                dynamic_fields = [
+                    field
+                    for field in schema_fields
+                    if field
+                    and field not in {"vector", "sparse_vector", "content"}
+                ]
+                if dynamic_fields:
+                    selected_fields = list(dict.fromkeys(dynamic_fields))
+            except Exception:
+                # Backends without collection metadata retain the known portable
+                # projection; correctness remains fail-closed at identity checks.
+                pass
+        else:
+            selected_fields = list(
+                dict.fromkeys(["id", "uri", "level", *sorted(output_fields)])
+            )
         hydrated: Dict[str, Dict[str, Any]] = {}
 
         def _accept(record: Mapping[str, Any]) -> None:
@@ -2034,7 +2040,7 @@ class VikingVectorIndexBackend:
                 )
             hydrated[record_id] = {
                 field: record[field]
-                for field in output_fields
+                for field in selected_fields
                 if field in record
             }
 
@@ -2048,7 +2054,7 @@ class VikingVectorIndexBackend:
                     In("id", chunk),
                     limit=batch_size,
                     cursor=cursor,
-                    output_fields=output_fields,
+                    output_fields=selected_fields,
                 )
                 for record in page:
                     _accept(record)

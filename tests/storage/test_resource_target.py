@@ -1,19 +1,10 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Tests for the AGFS resource target used by the DiffPlan apply executor.
-
-The target is the concrete write side of apply_diff_plan: it joins artifact
-relative paths onto the resource root, writes the already-normalized artifact
-bytes unchanged, and deletes files / L2 vectors.
-"""
+"""Tests for the AGFS resource target used by content tree actions."""
 
 import pytest
 
-from openviking.parse.output import ParseArtifactRef
-from openviking.storage.resource_diff_apply import apply_diff_plan
 from openviking.storage.resource_target import AgfsResourceTarget
-from openviking.storage.viking_fs._diff_plan import DiffPlan
-from openviking.utils.content_hash import content_md5
 
 
 class _Ctx:
@@ -50,17 +41,6 @@ class _FakeVikingDB:
         self.deleted_uris.extend(uris)
 
 
-class _FakeStore:
-    """Parse output store returning the artifact's final bytes."""
-
-    def __init__(self, files):
-        self._files = dict(files)
-
-    async def read_bytes(self, ref, rel_path):
-        return self._files[rel_path]
-
-
-_REF = ParseArtifactRef(backend="local", root="/tmp/art", root_type="dir")
 _ROOT = "viking://resources/proj"
 
 
@@ -127,28 +107,3 @@ class TestAgfsResourceTarget:
         target = _target(vfs, _FakeVikingDB())
 
         assert await target.read_file("a.py") == b"body"
-
-
-@pytest.mark.asyncio
-class TestApplyThroughAgfsTarget:
-    async def test_initial_upload_all_added_preserves_and_hashes_artifact_bytes(self) -> None:
-        # An initial import is "plan is all added": every file goes through the
-        # same target upload path as an incremental subset.
-        vfs = _FakeVikingFS()
-        store = _FakeStore({"a.py": "你好".encode("gbk"), "b.py": b"plain"})
-        target = _target(vfs, _FakeVikingDB())
-        expected = "你好".encode("gbk")
-        plan = DiffPlan(
-            added=["a.py", "b.py"],
-            new_md5s={
-                "a.py": content_md5(expected),
-                "b.py": content_md5(b"plain"),
-            },
-        )
-
-        result = await apply_diff_plan(plan, store=store, artifact_ref=_REF, target=target)
-
-        assert vfs.files[f"{_ROOT}/a.py"] == expected
-        assert vfs.files[f"{_ROOT}/b.py"] == b"plain"
-        # ApplyResult carries the manifest md5 for the exact bytes written to AGFS.
-        assert result.md5_by_rel["a.py"] == content_md5(expected)

@@ -723,6 +723,47 @@ async def test_incremental_hydration_projects_dynamic_non_vector_schema_fields()
 
 
 @pytest.mark.asyncio
+async def test_incremental_hydration_honors_explicit_summary_projection():
+    root = "viking://resources/docs"
+    record = _record(
+        "file-l2",
+        f"{root}/a.py",
+        level=2,
+        abstract="summary",
+        business_priority=7,
+    )
+    backend = _MemoryTransferBackend([record])
+    backend.get_collection_meta = AsyncMock(
+        return_value={
+            "Fields": [
+                {"FieldName": "id"},
+                {"FieldName": "uri"},
+                {"FieldName": "level"},
+                {"FieldName": "abstract"},
+                {"FieldName": "business_priority"},
+            ]
+        }
+    )
+    backend._strict_transfer_page = AsyncMock(return_value=([record], None))
+
+    hydrated = await backend.hydrate_incremental_records(
+        {"file-l2": {"uri": f"{root}/a.py", "level": 2}},
+        ctx=_ctx(),
+        output_fields={"abstract"},
+    )
+
+    assert hydrated["file-l2"] == {
+        "id": "file-l2",
+        "uri": f"{root}/a.py",
+        "level": 2,
+        "abstract": "summary",
+    }
+    fields = backend._strict_transfer_page.await_args.kwargs["output_fields"]
+    assert fields == ["id", "uri", "level", "abstract"]
+    backend.get_collection_meta.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_l2_diff_scan_reads_real_local_backend(tmp_path):
     if not getattr(vectordb_engine, "PersistStore", None):
         pytest.skip("local persistent vectordb engine is not available in this environment")

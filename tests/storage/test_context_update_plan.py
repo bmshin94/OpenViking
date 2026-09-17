@@ -311,11 +311,12 @@ async def test_resolver_compares_missing_fingerprints_with_bounded_reads():
     from openviking.storage.resource_rnfv import (
         FormalTreeSnapshot,
         NewArtifactSnapshot,
+        NewEntry,
         RequestIntent,
         RNFVSnapshot,
+        TargetFile,
         VectorIndexSnapshot,
     )
-    from openviking.storage.viking_fs._diff_plan import NewEntry, TargetFile
 
     paths = [f"{i}.py" for i in range(8)]
     snapshot = RNFVSnapshot(
@@ -389,11 +390,11 @@ async def test_resolver_hashes_new_file_when_manifest_md5_is_missing():
     from openviking.storage.resource_rnfv import (
         FormalTreeSnapshot,
         NewArtifactSnapshot,
+        NewEntry,
         RequestIntent,
         RNFVSnapshot,
         VectorIndexSnapshot,
     )
-    from openviking.storage.viking_fs._diff_plan import NewEntry
     from openviking.utils.content_hash import content_md5
 
     snapshot = RNFVSnapshot(
@@ -1102,11 +1103,11 @@ async def test_snapshot_builder_returns_one_canonical_context_plan():
     from openviking.storage.resource_rnfv import (
         FormalTreeSnapshot,
         NewArtifactSnapshot,
+        NewEntry,
         RequestIntent,
         RNFVSnapshot,
         VectorIndexSnapshot,
     )
-    from openviking.storage.viking_fs._diff_plan import NewEntry
 
     root = "viking://resources/repo"
     snapshot = RNFVSnapshot(
@@ -1144,12 +1145,13 @@ async def test_snapshot_builder_hydrates_scalars_for_vectors_only_upsert():
     from openviking.storage.resource_rnfv import (
         FormalTreeSnapshot,
         NewArtifactSnapshot,
+        NewEntry,
         RequestIntent,
         RNFVSnapshot,
+        TargetFile,
         VectorIndexSnapshot,
         VectorRecordSnapshot,
     )
-    from openviking.storage.viking_fs._diff_plan import NewEntry, TargetFile
 
     root = "viking://resources/repo"
     record = VectorRecordSnapshot(
@@ -1197,6 +1199,58 @@ async def test_snapshot_builder_hydrates_scalars_for_vectors_only_upsert():
     vikingdb.hydrate_incremental_records.assert_awaited_once()
     assert plan.direct_index_actions[0].record_id == record.record_id
     assert plan.direct_index_actions[0].fields["business_priority"] == 7
+
+
+@pytest.mark.asyncio
+async def test_file_root_plan_uses_file_refresh_without_directory_semantic_tree():
+    from openviking.storage.context_update_plan import build_context_update_plan_from_snapshot
+    from openviking.storage.resource_rnfv import (
+        FormalTreeSnapshot,
+        NewArtifactSnapshot,
+        NewEntry,
+        RequestIntent,
+        RNFVSnapshot,
+        TargetFile,
+        VectorIndexSnapshot,
+        VectorRecordSnapshot,
+    )
+
+    root = "viking://resources/report.md"
+    record = VectorRecordSnapshot(
+        "report-l2", root, "", 2, {"md5": "old", "abstract": "old"}
+    )
+    snapshot = RNFVSnapshot(
+        RequestIntent(root, "semantic_and_vectors"),
+        NewArtifactSnapshot({"": NewEntry(md5="new")}),
+        FormalTreeSnapshot({"": TargetFile()}),
+        VectorIndexSnapshot({"report-l2": record}, frozenset({"id", "uri", "level", "md5"})),
+    )
+    vikingdb = AsyncMock()
+    vikingdb.hydrate_incremental_records.return_value = {
+        "report-l2": {"abstract": "old"}
+    }
+
+    _, plan = await build_context_update_plan_from_snapshot(
+        snapshot=snapshot,
+        store=AsyncMock(read_bytes=AsyncMock(return_value=b"new")),
+        artifact_ref=object(),
+        target=AsyncMock(read_file=AsyncMock(return_value=b"old")),
+        vikingdb=vikingdb,
+        context_type="resource",
+        is_code_repo=False,
+        account_id="acc",
+        ctx=object(),
+        root_preexisting=True,
+        artifact_paths={"": "report.md"},
+        root_is_file=True,
+    )
+
+    assert [(action.operation.value, action.relative_path) for action in plan.content_tree_actions] == [
+        ("upsert", "")
+    ]
+    assert plan.semantic_plan is None
+    assert plan.file_refresh is not None
+    assert plan.file_refresh.md5 == "new"
 
 
 @pytest.mark.asyncio
@@ -1253,6 +1307,76 @@ async def test_hydration_promotes_a_dependency_when_its_record_disappears():
     assert records["sibling"].record_id == "sibling"
     assert "b.py" in active
     assert "b.py" in retained
+
+
+@pytest.mark.asyncio
+async def test_hydration_reads_summaries_before_full_scalars_for_active_records():
+    from openviking.storage.context_update_plan import (
+        ContentState,
+        IndexState,
+        hydrate_context_plan_records,
+    )
+    from openviking.storage.resource_diff import ResourceDiffEntry, ResourceDiffResult
+    from openviking.storage.resource_rnfv import RequestIntent, VectorRecordSnapshot
+
+    root = "viking://resources/repo"
+    inventory = {
+        "changed": VectorRecordSnapshot(
+            "changed", f"{root}/a.py", "a.py", 2, {"md5": "old"}
+        ),
+        "sibling": VectorRecordSnapshot(
+            "sibling", f"{root}/b.py", "b.py", 2, {"md5": "same"}
+        ),
+    }
+    vikingdb = AsyncMock()
+    vikingdb.hydrate_incremental_records.side_effect = [
+        {
+            "changed": {"abstract": "old a"},
+            "sibling": {"abstract": "old b"},
+        },
+        {"changed": {"business_priority": 7}},
+    ]
+    records, (active, _, retained) = await hydrate_context_plan_records(
+        diff=ResourceDiffResult(
+            {
+                "a.py": ResourceDiffEntry(
+                    "a.py",
+                    ContentState.MODIFIED,
+                    IndexState.STALE,
+                    old_kind="file",
+                    new_kind="file",
+                    md5="new",
+                ),
+                "b.py": ResourceDiffEntry(
+                    "b.py",
+                    ContentState.UNCHANGED,
+                    IndexState.COMPLETE,
+                    old_kind="file",
+                    new_kind="file",
+                    md5="same",
+                ),
+            }
+        ),
+        new_kinds={"": "directory", "a.py": "file", "b.py": "file"},
+        inventory=inventory,
+        vikingdb=vikingdb,
+        ctx=object(),
+        request=RequestIntent(root, "semantic_and_vectors"),
+    )
+
+    assert active == {"", "a.py"}
+    assert retained == {"", "a.py", "b.py"}
+    assert records["sibling"].fields == {"md5": "same", "abstract": "old b"}
+    assert records["changed"].fields == {
+        "md5": "old",
+        "abstract": "old a",
+        "business_priority": 7,
+    }
+    assert vikingdb.hydrate_incremental_records.await_args_list[0].kwargs["output_fields"] == {
+        "abstract"
+    }
+    assert "output_fields" not in vikingdb.hydrate_incremental_records.await_args_list[1].kwargs
+    assert set(vikingdb.hydrate_incremental_records.await_args_list[1].args[0]) == {"changed"}
 
 
 @pytest.mark.asyncio

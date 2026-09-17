@@ -15,12 +15,13 @@ from openviking.storage.resource_rnfv import (
     NON_PORTABLE_VECTOR_RECORD_FIELDS,
     FormalTreeSnapshot,
     NewArtifactSnapshot,
+    NewEntry,
     RequestIntent,
     RNFVSnapshot,
+    TargetFile,
     VectorRecordSnapshot,
 )
 from openviking.storage.vector_ids import vector_record_id
-from openviking.storage.viking_fs._diff_plan import NewEntry, TargetFile
 from openviking.utils.ingest_options import IngestOptions
 from openviking_cli.utils import VikingURI
 
@@ -51,6 +52,18 @@ class FileVectorSource(str, Enum):
 @dataclass(frozen=True)
 class ParentPropagation:
     enabled: bool = True
+
+
+@dataclass(frozen=True)
+class FileRefreshIntent:
+    """Refresh a flat file and its parent after synchronous content commit."""
+
+    file_uri: str
+    md5: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.file_uri.startswith("viking://"):
+            raise ValueError("file refresh requires a Viking URI")
 
 
 def _validate_relative_path(value: str) -> str:
@@ -324,6 +337,7 @@ class ContextUpdatePlan:
     content_tree_actions: tuple[ContentTreeAction, ...] = ()
     semantic_plan: SemanticPlan | None = None
     direct_index_actions: tuple[IndexAction, ...] = ()
+    file_refresh: FileRefreshIntent | None = None
 
     def __post_init__(self) -> None:
         root = self.root_uri.rstrip("/")
@@ -350,12 +364,15 @@ class ContextUpdatePlan:
                     if slot.record_id in record_ids:
                         raise ValueError("conflicting index actions")
                     record_ids.add(slot.record_id)
+        if self.file_refresh is not None and self.file_refresh.file_uri != root:
+            raise ValueError("file refresh must target the plan root")
 
     def is_noop(self) -> bool:
         return (
             not self.content_tree_actions
             and self.semantic_plan is None
             and not self.direct_index_actions
+            and self.file_refresh is None
         )
 
     def after_content_commit(self) -> "ContextUpdatePlan":
@@ -367,6 +384,7 @@ class ContextUpdatePlan:
             context_type=self.context_type,
             semantic_plan=self.semantic_plan,
             direct_index_actions=self.direct_index_actions,
+            file_refresh=self.file_refresh,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -388,6 +406,9 @@ class ContextUpdatePlan:
             ),
             direct_index_actions=tuple(
                 IndexAction(**item) for item in data.get("direct_index_actions", ())
+            ),
+            file_refresh=(
+                FileRefreshIntent(**data["file_refresh"]) if data.get("file_refresh") else None
             ),
         )
 
@@ -511,29 +532,34 @@ async def hydrate_context_plan_records(
     inventory: Mapping[str, VectorRecordSnapshot],
     vikingdb: Any,
     ctx: Any,
+    request: RequestIntent | None = None,
     repair_indexes: bool = True,
 ) -> tuple[Mapping[str, VectorRecordSnapshot], tuple[set[str], set[str], set[str]]]:
+    request = request or RequestIntent("", "semantic_and_vectors")
     active, membership_changed, retained = _semantic_closure(
         diff, new_kinds, repair_indexes=repair_indexes
     )
     result = dict(inventory)
-    hydrated_ids: set[str] = set()
-    while True:
+    summary_hydrated_ids: set[str] = set()
+
+    def required_summary_ids() -> dict[str, Mapping[str, Any]]:
         required: dict[str, Mapping[str, Any]] = {}
         for record_id, record in inventory.items():
-            if record.relative_path not in retained or record_id in hydrated_ids:
+            if record.relative_path not in retained:
                 continue
             kind = new_kinds.get(record.relative_path)
             wanted = {2} if kind == "file" else {0, 1} if record.relative_path in active else {0}
-            if record.level in wanted:
+            if (
+                record.level in wanted
+                and record_id not in summary_hydrated_ids
+                and not str(record.fields.get("abstract") or "").strip()
+            ):
                 required[record_id] = {"uri": record.uri, "level": record.level}
-        hydrated = await vikingdb.hydrate_incremental_records(required, ctx=ctx) if required else {}
-        # Inventory and hydration are separate reads. A missing hydration result
-        # has no reusable abstract, so the dependency is promoted below. Keep
-        # the inventory identity: an existing record must never be replaced by a
-        # locally recomputed ID merely because its second read raced or failed.
-        for record_id, payload in hydrated.items():
-            current = inventory[record_id]
+        return required
+
+    def merge_hydrated(payloads: Mapping[str, Mapping[str, Any]]) -> None:
+        for record_id, payload in payloads.items():
+            current = result[record_id]
             fields = {
                 key: value
                 for key, value in payload.items()
@@ -541,9 +567,28 @@ async def hydrate_context_plan_records(
                 and value is not None
             }
             result[record_id] = VectorRecordSnapshot(
-                current.record_id, current.uri, current.relative_path, current.level, fields
+                current.record_id,
+                current.uri,
+                current.relative_path,
+                current.level,
+                {**current.fields, **fields},
             )
-        hydrated_ids.update(required)
+
+    while True:
+        required = required_summary_ids()
+        hydrated = (
+            await vikingdb.hydrate_incremental_records(
+                required, ctx=ctx, output_fields={"abstract"}
+            )
+            if required
+            else {}
+        )
+        # Inventory and hydration are separate reads. A missing hydration result
+        # has no reusable abstract, so the dependency is promoted below. Keep
+        # the inventory identity: an existing record must never be replaced by a
+        # locally recomputed ID merely because its second read raced or failed.
+        merge_hydrated(hydrated)
+        summary_hydrated_ids.update(required)
 
         by_path, _ = _records_by_path(result)
         promoted = {
@@ -556,11 +601,30 @@ async def hydrate_context_plan_records(
             )
         }
         if not promoted:
-            return result, (active, membership_changed, retained)
+            break
         active.update(promoted)
         for path in new_kinds:
             if path and _parent(path) in active:
                 retained.add(path)
+
+    if request.vectorize:
+        required_scalars: dict[str, Mapping[str, Any]] = {}
+        for record_id, record in result.items():
+            kind = new_kinds.get(record.relative_path)
+            if record.relative_path not in active:
+                continue
+            if request.processing_mode == "vectors_only":
+                if kind != "file" or record.level != 2:
+                    continue
+            elif record.level not in ({2} if kind == "file" else {0, 1}):
+                continue
+            required_scalars[record_id] = {"uri": record.uri, "level": record.level}
+        if required_scalars:
+            merge_hydrated(
+                await vikingdb.hydrate_incremental_records(required_scalars, ctx=ctx)
+            )
+
+    return result, (active, membership_changed, retained)
 
 
 def build_context_update_plan(
@@ -815,11 +879,13 @@ async def build_context_update_plan_from_snapshot(
     artifact_paths: Mapping[str, str] | None = None,
     ingest_options: Any = None,
     source_metadata: Mapping[str, str] | None = None,
+    root_is_file: bool = False,
 ) -> tuple[Any, ContextUpdatePlan]:
     """Resolve RNFV facts, hydrate the minimal closure, and build one plan."""
     from openviking.storage.resource_diff import resolve_resource_diff
 
-    snapshot = _with_directory_root(snapshot, root_preexisting=root_preexisting)
+    if not root_is_file:
+        snapshot = _with_directory_root(snapshot, root_preexisting=root_preexisting)
     paths = dict(artifact_paths or {})
     diff = await resolve_resource_diff(
         snapshot,
@@ -838,9 +904,10 @@ async def build_context_update_plan_from_snapshot(
         inventory=snapshot.vectors.records_by_id,
         vikingdb=vikingdb,
         ctx=ctx,
+        request=snapshot.request,
         repair_indexes=snapshot.request.processing_mode != "vectors_only",
     )
-    return diff, build_context_update_plan(
+    plan = build_context_update_plan(
         root_uri=snapshot.request.target_uri,
         context_type=context_type,
         request=snapshot.request,
@@ -853,6 +920,32 @@ async def build_context_update_plan_from_snapshot(
         ingest_options=ingest_options,
         source_metadata=source_metadata,
         closure=closure,
+    )
+    if not root_is_file:
+        return diff, plan
+
+    root_entry = diff.entries[""]
+    needs_refresh = (
+        ContentState(root_entry.content_state)
+        in {
+            ContentState.ADDED,
+            ContentState.RESTORE,
+            ContentState.MODIFIED,
+            ContentState.REPLACE_KIND,
+        }
+        or IndexState(root_entry.index_state)
+        in {IndexState.MISSING, IndexState.PARTIAL, IndexState.STALE, IndexState.LEVEL_CONFLICT}
+    )
+    return diff, ContextUpdatePlan(
+        root_uri=plan.root_uri,
+        context_type=plan.context_type,
+        content_tree_actions=plan.content_tree_actions,
+        direct_index_actions=plan.direct_index_actions,
+        file_refresh=(
+            FileRefreshIntent(snapshot.request.target_uri, root_entry.md5)
+            if needs_refresh and snapshot.request.processing_mode != "vectors_only"
+            else None
+        ),
     )
 
 
@@ -902,6 +995,7 @@ __all__ = [
     "ContentTreeOperation",
     "ContextUpdatePlan",
     "FileVectorSource",
+    "FileRefreshIntent",
     "IndexAction",
     "IndexOperation",
     "IndexSlot",

@@ -6,12 +6,32 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from openviking.storage.context_update_plan import (
+    ContextUpdatePlan,
+    FileRefreshIntent,
+    SemanticPlan,
+    SemanticTreeEntry,
+    SemanticTreeSnapshot,
+)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 class _DummyVikingDB:
     def get_embedder(self):
         return None
+
+
+def _directory_plan(root_uri: str) -> ContextUpdatePlan:
+    return ContextUpdatePlan(
+        root_uri,
+        "resource",
+        semantic_plan=SemanticPlan(
+            root_uri,
+            "resource",
+            SemanticTreeSnapshot((SemanticTreeEntry("", "directory", "added", "aggregate"),)),
+        ),
+    )
 
 
 class _DummyTelemetry:
@@ -227,6 +247,9 @@ async def test_resource_processor_rejects_partial_directory_before_semantic_plan
     rp.tree_builder.finalize_from_temp = AsyncMock(
         side_effect=AssertionError("partial artifact must not reach finalize/diff")
     )
+    rp._commit_directory_artifact_with_plan = AsyncMock(
+        return_value=_directory_plan("viking://resources/root")
+    )
 
     result = await rp.process_resource(path="repo", ctx=object(), build_index=True)
 
@@ -394,6 +417,9 @@ async def test_resource_processor_first_add_summarizes_from_committed_uri(monkey
             root=SimpleNamespace(uri="viking://resources/root", temp_uri="viking://temp/root_tmp")
         )
     )
+    rp._commit_directory_artifact_with_plan = AsyncMock(
+        return_value=_directory_plan("viking://resources/root")
+    )
     rp._summarizer = SimpleNamespace(
         summarize=AsyncMock(
             side_effect=lambda *args, **kwargs: (
@@ -406,9 +432,7 @@ async def test_resource_processor_first_add_summarizes_from_committed_uri(monkey
 
     assert result["status"] == "success"
     assert result["root_uri"] == "viking://resources/root"
-    assert fake_fs.persist_calls == [
-        ("viking://temp/root_tmp", "viking://resources/root", {"id": "lock-1"})
-    ]
+    assert fake_fs.persist_calls == []
     assert fake_fs.delete_temp_calls == [("viking://temp/tmpdir", None)]
     assert summarize_calls[0]["temp_uris"] == ["viking://resources/root"]
     assert summarize_calls[0]["target_preexisting"] is False
@@ -479,7 +503,7 @@ async def test_directory_semantic_ingest_commits_plan_before_summarizer(monkeypa
     kwargs = summarize.await_args.kwargs
     assert SemanticPlan.from_dict(kwargs["semantic_plan"]) == plan
     assert kwargs["temp_uris"] == ["viking://resources/root"]
-    assert kwargs["artifact_ref"] is None
+    assert kwargs.get("artifact_ref") is None
 
 
 @pytest.mark.asyncio
@@ -520,6 +544,11 @@ async def test_resource_processor_allows_flat_root_only_for_single_no_split_sour
             ),
             _root_is_file=True,
             _candidate_uri=root_uri if auto_candidate else None,
+        )
+    )
+    rp._commit_directory_artifact_with_plan = AsyncMock(
+        return_value=ContextUpdatePlan(
+            root_uri, "resource", file_refresh=FileRefreshIntent(root_uri, "new-md5")
         )
     )
     rp._summarizer = SimpleNamespace(
@@ -572,6 +601,9 @@ async def test_resource_processor_keeps_wrapper_for_directory_to_no_split(monkey
             _root_is_file=False,
         )
     )
+    rp._commit_directory_artifact_with_plan = AsyncMock(
+        return_value=_directory_plan("viking://resources/0803_shendiao_01")
+    )
     rp._summarizer = SimpleNamespace(summarize=AsyncMock(return_value={"status": "success"}))
 
     result = await rp.process_resource(
@@ -616,6 +648,9 @@ async def test_resource_processor_second_add_preserves_temp_uri_for_incremental(
         root=SimpleNamespace(uri="viking://resources/root", temp_uri="viking://temp/root_tmp")
     )
     rp.tree_builder.finalize_from_temp = AsyncMock(return_value=context_tree)
+    rp._commit_directory_artifact_with_plan = AsyncMock(
+        return_value=_directory_plan("viking://resources/root")
+    )
     rp._summarizer = SimpleNamespace(
         summarize=AsyncMock(
             side_effect=lambda *args, **kwargs: (
@@ -628,7 +663,7 @@ async def test_resource_processor_second_add_preserves_temp_uri_for_incremental(
 
     assert result["status"] == "success"
     assert result["root_uri"] == "viking://resources/root"
-    assert summarize_calls[0]["temp_uris"] == ["viking://temp/root_tmp"]
+    assert summarize_calls[0]["temp_uris"] == ["viking://resources/root"]
     assert summarize_calls[0]["target_preexisting"] is True
     assert fake_fs.persist_calls == []
 
@@ -664,6 +699,9 @@ async def test_resource_processor_auto_candidate_skips_existing_and_busy(monkeyp
         _candidate_uri="viking://resources/root",
     )
     rp.tree_builder.finalize_from_temp = AsyncMock(return_value=context_tree)
+    rp._commit_directory_artifact_with_plan = AsyncMock(
+        side_effect=lambda **kwargs: _directory_plan(kwargs["root_uri"])
+    )
     rp._summarizer = SimpleNamespace(
         summarize=AsyncMock(
             side_effect=lambda *args, **kwargs: (
@@ -688,6 +726,4 @@ async def test_resource_processor_auto_candidate_skips_existing_and_busy(monkeyp
     assert fake_pathlock.acquired_tree_paths == ["/mock/resources/root_2"]
     assert summarize_calls[0]["temp_uris"] == ["viking://resources/root_2"]
     assert summarize_calls[0]["target_preexisting"] is False
-    assert fake_fs.persist_calls == [
-        ("viking://temp/root_tmp", "viking://resources/root_2", {"id": "lock-1"})
-    ]
+    assert fake_fs.persist_calls == []

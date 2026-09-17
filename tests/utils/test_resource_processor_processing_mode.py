@@ -367,7 +367,7 @@ async def test_plan_artifact_is_cleaned_only_after_semantic_enqueue(monkeypatch,
     processor._build_parse_output_store = Mock(return_value=store)
 
     async def summarize(**kwargs):
-        assert kwargs["artifact_ref"] is None
+        assert kwargs.get("artifact_ref") is None
         assert tmp_path.joinpath("artifacts", ref.root.split("/")[-1]).exists()
         return {"status": "success", "enqueued_count": 1}
 

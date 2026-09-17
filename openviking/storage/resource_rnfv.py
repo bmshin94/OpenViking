@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Typed R/N/F/V inputs for resource diff planning.
+"""Typed R/N/F/V inputs for resource update planning.
 
 R is normalized request intent, N is the parser artifact snapshot, F is the
 formal resource tree, and V is the vector-index snapshot.  A validated snapshot
-contains every fact needed by the pure diff planner; the planner must not read
-the request or either storage backend again.
+contains every fact needed by the update planner; the planner must not read the
+request or either storage backend again.
 """
 
 from __future__ import annotations
@@ -41,6 +41,23 @@ NON_PORTABLE_VECTOR_RECORD_FIELDS = frozenset(
 )
 _SCALAR_MODES = frozenset({"replace", "append"})
 _SCALAR_FIELDS = frozenset({"search_tags"})
+
+# Parser and formal-tree entries use the same compact shape. They are defined
+# beside RNFV rather than a legacy planner so every update path shares them.
+CONTROL_BASENAMES = frozenset(
+    {".abstract.md", ".overview.md", ".image_mappings.json", ".artifact_manifest.json"}
+)
+
+
+@dataclass(frozen=True)
+class NewEntry:
+    md5: str = ""
+    is_dir: bool = False
+
+
+@dataclass(frozen=True)
+class TargetFile:
+    is_dir: bool = False
 
 
 @dataclass(frozen=True)
@@ -171,12 +188,15 @@ class RNFVSnapshot:
 
 __all__ = [
     "BASE_VECTOR_PROJECTION",
+    "CONTROL_BASENAMES",
     "FormalTreeSnapshot",
     "NewArtifactSnapshot",
+    "NewEntry",
     "NON_PORTABLE_VECTOR_RECORD_FIELDS",
     "RequestIntent",
     "RNFVSnapshot",
     "ScalarIntent",
+    "TargetFile",
     "VectorIndexSnapshot",
     "VectorRecordSnapshot",
 ]
