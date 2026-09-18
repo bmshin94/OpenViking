@@ -653,6 +653,25 @@ async def test_vectorize_directory_meta_appends_search_tags_by_level(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_vectorize_directory_meta_applies_partial_update_per_level(monkeypatch):
+    queue = DummyQueue()
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: DummyFS("ignored"))
+
+    await embedding_utils.vectorize_directory_meta(
+        uri="viking://user/default/resources/demo",
+        abstract="demo abstract",
+        overview="demo overview",
+        ctx=DummyReq(),
+        partial_update_levels={0},
+    )
+
+    assert len(queue.items) == 2
+    assert "_upsert_options" not in queue.items[0].context_data
+    assert queue.items[1].context_data["_upsert_options"] == {"partial_update": False}
+
+
+@pytest.mark.asyncio
 async def test_vectorize_directory_meta_l1_abstract_is_overview(monkeypatch):
     """L1 records must carry the overview in the abstract scalar so Rerank
     sees L1 text instead of the L0 abstract."""

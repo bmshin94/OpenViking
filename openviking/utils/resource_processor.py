@@ -230,6 +230,7 @@ class ResourceProcessor:
         )
         from openviking.storage.resource_diff import (
             build_rnfv_snapshot,
+            count_tree_entry_kinds,
             prepare_artifact_inventory,
         )
         from openviking.storage.resource_target import AgfsResourceTarget
@@ -280,16 +281,21 @@ class ResourceProcessor:
                 )
             from collections import Counter
 
+            n_files, n_dirs, _ = count_tree_entry_kinds(rnfv.new.entries)
+            f_files, f_dirs, _ = count_tree_entry_kinds(rnfv.formal.entries)
             logger.info(
                 "[RNFVSnapshot] %s target=%s artifact_backend=%s root_is_file=%s "
-                "target_preexisting=%s n_entries=%d f_entries=%d v_records=%d v_levels=%s",
+                "target_preexisting=%s n_files=%d n_dirs=%d f_files=%d f_dirs=%d "
+                "v_records=%d v_levels=%s",
                 log_correlation(),
                 root_uri,
                 artifact_backend,
                 root_is_file,
                 target_preexisting,
-                len(rnfv.new.entries),
-                len(rnfv.formal.entries),
+                n_files,
+                n_dirs,
+                f_files,
+                f_dirs,
                 len(rnfv.vectors.records_by_id),
                 dict(Counter(record.level for record in rnfv.vectors.records_by_id.values())),
             )
@@ -1276,7 +1282,15 @@ class ResourceProcessor:
                     ctx=ctx,
                     file_md5=action.md5,
                     scalar_override={**dict(action.fields), "_record_id": action.record_id},
-                    partial_update=False,
+                    partial_update=action.partial_update,
+                    ingest_options=(
+                        IngestOptions.from_search_tags(
+                            action.fields.get("search_tags"),
+                            mode=action.search_tag_mode,
+                        )
+                        if "search_tags" in action.fields
+                        else None
+                    ),
                 )
                 continue
             if action.operation != IndexOperation.UPDATE_FIELDS:

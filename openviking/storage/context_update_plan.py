@@ -121,6 +121,7 @@ class IndexSlot:
     trigger: SemanticOutputCondition | None = None
     fields: Mapping[str, Any] = field(default_factory=dict)
     fallback_update_fields: bool = False
+    partial_update: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "operation", IndexOperation(self.operation))
@@ -136,6 +137,8 @@ class IndexSlot:
             raise ValueError("index trigger requires an operation")
         if self.operation is not IndexOperation.NONE and self.trigger is None:
             raise ValueError("semantic index operation requires a trigger")
+        if self.partial_update and self.operation is not IndexOperation.UPSERT:
+            raise ValueError("partial update requires an index upsert")
         _validate_index_fields(self.existing_fields or {})
         _validate_index_fields(self.fields)
 
@@ -382,6 +385,8 @@ class IndexAction:
     record_id: str
     fields: Mapping[str, Any] = field(default_factory=dict)
     md5: str | None = None
+    partial_update: bool = False
+    search_tag_mode: str = "replace"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "operation", IndexOperation(self.operation))
@@ -392,6 +397,10 @@ class IndexAction:
         _validate_index_fields(self.fields)
         if self.operation is IndexOperation.UPDATE_FIELDS and not self.fields:
             raise ValueError("field update requires fields")
+        if self.partial_update and self.operation is not IndexOperation.UPSERT:
+            raise ValueError("partial update requires a direct index upsert")
+        if self.search_tag_mode not in {"replace", "append"}:
+            raise ValueError("invalid search tag mode")
 
 
 @dataclass(frozen=True)
@@ -541,9 +550,19 @@ def _resolved_scalar_fields(
         old = normalize_search_tags(existing.get(intent.field), discard_invalid=True)
         incoming = normalize_search_tags(intent.value, discard_invalid=True)
         desired = merge_search_tags(old, incoming) if intent.mode == "append" else incoming
-        if sorted(old) != sorted(desired):
+        # A missing inventory record may still exist in the vector backend.  In
+        # that repair path, partial update needs an explicit empty replacement
+        # to clear existing tags instead of silently preserving them.
+        if record is None or sorted(old) != sorted(desired):
             result[intent.field] = desired
     return result
+
+
+def _search_tag_mode(request: RequestIntent) -> str:
+    return next(
+        (intent.mode for intent in request.scalar_intents if intent.field == "search_tags"),
+        "replace",
+    )
 
 
 def _semantic_closure(
@@ -811,6 +830,8 @@ def build_context_update_plan(
                         **_resolved_scalar_fields(request, record),
                     },
                     md5=entry.md5,
+                    partial_update=bool(record is None and entry.old_kind == kind),
+                    search_tag_mode=_search_tag_mode(request),
                 )
             )
 
@@ -890,6 +911,7 @@ def build_context_update_plan(
                     else None,
                     fields=fields,
                     fallback_update_fields=(state is ContentState.MODIFIED or bool(fields)),
+                    partial_update=bool(record is None and diff_entry and diff_entry.old_kind == kind),
                 )
             )
         semantic_entries.append(

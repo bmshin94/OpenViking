@@ -1722,6 +1722,7 @@ class SemanticProcessor(DequeueHandlerBase):
         creator_acl_grant: CreatorAclGrant | None = None,
         scalar_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
         partial_update: bool = True,
+        partial_update_levels: Optional[Set[int]] = None,
         include_abstract: bool = True,
         include_overview: bool = True,
     ) -> set[int]:
@@ -1740,6 +1741,7 @@ class SemanticProcessor(DequeueHandlerBase):
             creator_acl_grant=creator_acl_grant,
             scalar_overrides=scalar_overrides,
             partial_update=partial_update,
+            partial_update_levels=partial_update_levels,
             include_abstract=include_abstract,
             include_overview=include_overview,
         )

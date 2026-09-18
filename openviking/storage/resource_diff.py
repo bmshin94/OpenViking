@@ -132,6 +132,22 @@ class ArtifactInventory:
     rewritten_paths: frozenset[str] = frozenset()
 
 
+def count_tree_entry_kinds(
+    entries: Mapping[str, NewEntry | FormalEntry],
+) -> tuple[int, int, bool]:
+    """Return business file/dir counts and whether a logical root is present.
+
+    Directory plans add ``relative_path=""`` as a traversal-only root. Keeping
+    it separate prevents logs from presenting that synthetic node as a file or
+    directory stored below the target. A flat resource uses the same empty path
+    with ``is_dir=False`` and is therefore counted as one real file.
+    """
+    logical_root = bool((root := entries.get("")) is not None and root.is_dir)
+    files = sum(not entry.is_dir for entry in entries.values())
+    directories = sum(entry.is_dir for path, entry in entries.items() if path)
+    return files, directories, logical_root
+
+
 def _index_state(
     records: tuple[VectorRecordSnapshot, ...],
     *,
@@ -283,19 +299,42 @@ async def resolve_resource_diff(
             md5=md5,
         )
     resolved = ResourceDiffResult(entries=result)
-    content_counts = Counter(entry.content_state.value for entry in resolved.entries.values())
-    index_counts = Counter(entry.index_state.value for entry in resolved.entries.values())
+    n_files, n_dirs, n_has_root = count_tree_entry_kinds(new)
+    f_files, f_dirs, f_has_root = count_tree_entry_kinds(formal)
+    file_entries = [
+        entry
+        for path, entry in resolved.entries.items()
+        if path and (entry.new_kind or entry.old_kind) == "file"
+    ]
+    directory_entries = [
+        entry
+        for path, entry in resolved.entries.items()
+        if path and (entry.new_kind or entry.old_kind) == "directory"
+    ]
+    root_entry = resolved.entries.get("")
+    file_content_counts = Counter(entry.content_state.value for entry in file_entries)
+    directory_content_counts = Counter(entry.content_state.value for entry in directory_entries)
+    file_index_counts = Counter(entry.index_state.value for entry in file_entries)
+    directory_index_counts = Counter(entry.index_state.value for entry in directory_entries)
     logger.info(
-        "[ResourceDiffResult] %s target=%s n_entries=%d f_entries=%d v_records=%d "
-        "content_states=%s index_states=%s md5_fast_path=%d body_compared=%d "
-        "new_files_hashed=%d",
+        "[ResourceDiffResult] %s target=%s n_files=%d n_dirs=%d f_files=%d f_dirs=%d "
+        "logical_root=%s v_records=%d file_states=%s dir_states=%s "
+        "file_index=%s dir_index=%s root_state=%s root_index=%s "
+        "md5_fast_path=%d body_compared=%d new_files_hashed=%d",
         log_correlation(),
         snapshot.request.target_uri,
-        len(new),
-        len(formal),
+        n_files,
+        n_dirs,
+        f_files,
+        f_dirs,
+        str(n_has_root or f_has_root).lower(),
         len(snapshot.vectors.records_by_id),
-        dict(content_counts),
-        dict(index_counts),
+        dict(file_content_counts),
+        dict(directory_content_counts),
+        dict(file_index_counts),
+        dict(directory_index_counts),
+        root_entry.content_state.value if root_entry is not None else "none",
+        root_entry.index_state.value if root_entry is not None else "none",
         md5_fast_path_count,
         len(compare_paths),
         len(hash_paths),
@@ -571,6 +610,7 @@ __all__ = [
     "ResourceDiffEntry",
     "ResourceDiffResult",
     "build_rnfv_snapshot",
+    "count_tree_entry_kinds",
     "prepare_artifact_inventory",
     "read_target_file_snapshot",
 ]

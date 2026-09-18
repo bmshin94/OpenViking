@@ -9,7 +9,7 @@ Common logic for creating Context objects and enqueuing them to EmbeddingQueue.
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 from charset_normalizer import from_bytes
 
@@ -378,6 +378,7 @@ async def vectorize_directory_meta(
     creator_acl_grant: CreatorAclGrant | None = None,
     include_abstract: bool = True,
     partial_update: bool = True,
+    partial_update_levels: Optional[Set[int]] = None,
 ) -> set[int]:
     """
     Vectorize directory metadata (.abstract.md and .overview.md).
@@ -432,10 +433,16 @@ async def vectorize_directory_meta(
                 msg_abstract,
                 (scalar_overrides or {}).get(int(ContextLevel.ABSTRACT.value)),
             )
-            if msg_abstract and not partial_update:
-                msg_abstract.context_data.setdefault("_upsert_options", {})["partial_update"] = (
-                    partial_update
+            if msg_abstract:
+                level_partial_update = (
+                    int(ContextLevel.ABSTRACT.value) in partial_update_levels
+                    if partial_update_levels is not None
+                    else partial_update
                 )
+                if not level_partial_update:
+                    msg_abstract.context_data.setdefault("_upsert_options", {})[
+                        "partial_update"
+                    ] = False
             _apply_ingest_options(msg_abstract, ingest_options)
             if msg_abstract:
                 try:
@@ -482,10 +489,16 @@ async def vectorize_directory_meta(
                 msg_overview,
                 (scalar_overrides or {}).get(int(ContextLevel.OVERVIEW.value)),
             )
-            if msg_overview and not partial_update:
-                msg_overview.context_data.setdefault("_upsert_options", {})["partial_update"] = (
-                    partial_update
+            if msg_overview:
+                level_partial_update = (
+                    int(ContextLevel.OVERVIEW.value) in partial_update_levels
+                    if partial_update_levels is not None
+                    else partial_update
                 )
+                if not level_partial_update:
+                    msg_overview.context_data.setdefault("_upsert_options", {})[
+                        "partial_update"
+                    ] = False
             _apply_ingest_options(msg_overview, ingest_options)
             if msg_overview:
                 try:

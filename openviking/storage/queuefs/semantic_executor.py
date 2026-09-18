@@ -1159,7 +1159,9 @@ class SemanticTreeExecutor:
                         vectorize_kwargs["scalar_override"] = self._plan_scalar_override(
                             file_path, 2
                         )
-                        vectorize_kwargs["partial_update"] = False
+                        vectorize_kwargs["partial_update"] = bool(
+                            slot is not None and slot.partial_update
+                        )
                     enqueued = await self._processor._vectorize_single_file(
                         parent_uri=parent_uri,
                         context_type=self._context_type,
@@ -1445,21 +1447,22 @@ class SemanticTreeExecutor:
         except Exception as e:
             logger.error(f"Failed to generate overview for {dir_uri}: {e}", exc_info=True)
         else:
+            slots = {}
+            if self._semantic_plan is not None:
+                entry = self._plan_entries_by_uri.get(dir_uri.rstrip("/"))
+                slots = {slot.level: slot for slot in entry.index_slots} if entry else {}
+
             if need_vectorize and not self._skip_vectorization:
                 assert overview is not None and abstract is not None
                 try:
                     directory_vector_kwargs: Dict[str, Any] = {}
                     include_abstract = True
                     include_overview = True
-                    slots = {}
                     if self._semantic_plan is not None:
                         from openviking.storage.context_update_plan import (
                             IndexOperation,
                             SemanticOutputCondition,
                         )
-
-                        entry = self._plan_entries_by_uri.get(dir_uri.rstrip("/"))
-                        slots = {slot.level: slot for slot in entry.index_slots} if entry else {}
 
                         def should_emit(level: int) -> bool:
                             slot = slots.get(level)
@@ -1483,7 +1486,9 @@ class SemanticTreeExecutor:
                                 for level in (0, 1)
                                 if (values := self._plan_scalar_override(dir_uri, level))
                             },
-                            "partial_update": False,
+                            "partial_update_levels": {
+                                level for level, slot in slots.items() if slot.partial_update
+                            },
                             "include_abstract": include_abstract,
                             "include_overview": include_overview,
                         }
@@ -1500,29 +1505,6 @@ class SemanticTreeExecutor:
                         )
                     else:
                         enqueued_levels = set()
-                    for level, slot in sorted(slots.items()):
-                        if (
-                            level not in enqueued_levels
-                            and slot.fallback_update_fields
-                            and slot.fields
-                        ):
-                            enqueued = await self._processor._update_vector_fields(
-                                record_id=slot.record_id,
-                                uri=dir_uri,
-                                level=level,
-                                fields=dict(slot.fields),
-                                ctx=self._ctx,
-                            )
-                            if enqueued:
-                                enqueued_levels.add(level)
-                    if self._semantic_plan is not None:
-                        entry = self._plan_entries_by_uri.get(dir_uri.rstrip("/"))
-                        if entry is not None:
-                            self._scheduled_vector_record_ids.update(
-                                slot.record_id
-                                for slot in entry.index_slots
-                                if slot.level in (enqueued_levels or set())
-                            )
                 except Exception as e:
                     logger.error(
                         "Failed to schedule vectorization for %s: %s",
@@ -1531,6 +1513,28 @@ class SemanticTreeExecutor:
                         exc_info=True,
                     )
                     raise
+            else:
+                enqueued_levels = set()
+
+            for level, slot in sorted(slots.items()):
+                if level in enqueued_levels or not slot.fallback_update_fields or not slot.fields:
+                    continue
+                enqueued = await self._processor._update_vector_fields(
+                    record_id=slot.record_id,
+                    uri=dir_uri,
+                    level=level,
+                    fields=dict(slot.fields),
+                    ctx=self._ctx,
+                )
+                if enqueued:
+                    enqueued_levels.add(level)
+
+            if self._semantic_plan is not None:
+                self._scheduled_vector_record_ids.update(
+                    slot.record_id
+                    for slot in slots.values()
+                    if slot.level in enqueued_levels
+                )
         finally:
             self._stats.done_nodes += 1
             self._stats.in_progress_nodes = max(0, self._stats.in_progress_nodes - 1)
